@@ -61,8 +61,12 @@ _load_dotenv()
 # ----------------------------------------------------------------------------
 # 配置（环境变量）
 # ----------------------------------------------------------------------------
-# 要重点关注的容器名前缀（用于标记「平台核心容器」）
-WATCH_PREFIXES = os.environ.get("WATCH_PREFIXES", "sentry,posthog,clickhouse,kafka,redis,postgres,snuba").split(",")
+# 平台核心容器（名称包含即匹配，用于标 ★）。注意别写 sentry/posthog 这种所有容器都含的词，否则 ★ 失去区分意义。
+WATCH_PREFIXES = os.environ.get(
+    "WATCH_PREFIXES",
+    "-web-,-nginx-,-relay-,-postgres-,-db-,-pgbouncer-,-kafka-,-clickhouse-,-redis,"
+    "-snuba-api-,-taskworker-,-capture-,-ingestion-",
+).split(",")
 # 完全不参与判定的容器（逗号分隔，名称包含即匹配），用于已知的一次性/废弃容器
 IGNORE_CONTAINERS = [p.strip() for p in os.environ.get("IGNORE_CONTAINERS", "").split(",") if p.strip()]
 
@@ -84,6 +88,10 @@ SWAP_CRIT_GB = float(os.environ.get("SWAP_CRIT_GB", "10"))    # 同 Slack SWAP_C
 LOAD_PER_CPU_WARN = float(os.environ.get("LOAD_PER_CPU_WARN", "1.5"))  # 每核 load
 RECENT_RESTART_DAYS = float(os.environ.get("RECENT_RESTART_DAYS", "1"))  # uptime < N 天视为「最近重启」
 WEB_LATENCY_WARN_MS = int(os.environ.get("WEB_LATENCY_WARN_MS", "5000"))  # 网页/健康端点响应过慢阈值
+# 以下为本脚本独有（Slack 不管的「趋势/活动」类信号，依赖上次巡检的 state.json）
+SWAP_IO_WARN_KBPS = float(os.environ.get("SWAP_IO_WARN_KBPS", "1024"))  # 上次巡检以来 swap 换入+换出平均 KB/s
+RESTART_DELTA_CRIT = int(os.environ.get("RESTART_DELTA_CRIT", "3"))  # 上次巡检以来新增重启 ≥N → CRIT（≥1 → WARN）
+TOP_MEM_N = int(os.environ.get("TOP_MEM_N", "8"))                     # 发给 AI 的内存占用前 N 名容器
 
 # AI
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").strip().lower()   # gemini | anthropic
@@ -97,6 +105,7 @@ REPORT_LANG = os.environ.get("REPORT_LANG", "ja")
 OUT_DIR = os.environ.get("OUT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "out"))
 KEEP_DAYS = int(os.environ.get("KEEP_DAYS", "14"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
+STATE_FILE = os.path.join(OUT_DIR, "state.json")   # 上次巡检的计数器（重启次数 / swap 换页），用于算增量
 INSECURE = os.environ.get("WEB_INSECURE", "") == "1"
 
 
@@ -141,7 +150,7 @@ def collect_containers():
     # 一次 inspect 全部，输出可解析的分隔行
     fmt = ("{{.Name}}\t{{.State.Status}}\t"
            "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}\t"
-           "{{.RestartCount}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}\t{{.State.ExitCode}}")
+           "{{.RestartCount}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}\t{{.State.ExitCode}}\t{{.Id}}")
     try:
         insp = subprocess.run(
             ["docker", "inspect", "--format", fmt] + names,
@@ -155,7 +164,7 @@ def collect_containers():
         if not line.strip():
             continue
         parts = line.split("\t")
-        if len(parts) < 7:
+        if len(parts) < 8:
             continue
         name = parts[0].lstrip("/")
         watched = any(name.startswith(p.strip()) or (p.strip() in name) for p in WATCH_PREFIXES if p.strip())
@@ -170,6 +179,7 @@ def collect_containers():
             "exit_code": int(parts[6]) if parts[6].lstrip("-").isdigit() else None,
             "watched": watched,
             "ignored": any(p in name for p in IGNORE_CONTAINERS),
+            "id": parts[7].strip(),
         })
     containers.sort(key=lambda c: (not c["watched"], c["name"]))
     return {"error": None}, containers
@@ -227,6 +237,145 @@ def collect_host():
     except Exception as e:  # noqa
         host["load"] = {"error": str(e)}
     return host
+
+
+# ----------------------------------------------------------------------------
+# 1b) 容器内存 / swap（cgroup v2 直读，零开销；读不到时退回 docker stats，仅内存）
+# ----------------------------------------------------------------------------
+def _read_cg_int(path):
+    with open(path) as f:
+        v = f.read().strip()
+    return None if v == "max" else int(v)
+
+
+def _cgroup_dir(cid):
+    # systemd cgroup driver（Amazon Linux 2023 等默认） / cgroupfs driver
+    for d in (f"/sys/fs/cgroup/system.slice/docker-{cid}.scope", f"/sys/fs/cgroup/docker/{cid}"):
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+_SIZE_UNITS = {"b": 1, "kb": 1e3, "mb": 1e6, "gb": 1e9, "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3}
+
+
+def _parse_size(text):
+    """'1.23GiB' → 字节数。"""
+    t = text.strip().lower()
+    for u in sorted(_SIZE_UNITS, key=len, reverse=True):
+        if t.endswith(u):
+            return float(t[: -len(u)]) * _SIZE_UNITS[u]
+    return float(t)
+
+
+def collect_container_mem(containers):
+    """给运行中容器补上 mem_mb / swap_mb / mem_limit_mb（口径同 docker stats：memory.current - inactive_file）。"""
+    found = 0
+    for c in containers:
+        if c["status"] != "running" or not c.get("id"):
+            continue
+        d = _cgroup_dir(c["id"])
+        if not d:
+            continue
+        try:
+            cur = _read_cg_int(os.path.join(d, "memory.current"))
+            inactive = 0
+            with open(os.path.join(d, "memory.stat")) as f:
+                for line in f:
+                    if line.startswith("inactive_file "):
+                        inactive = int(line.split()[1])
+                        break
+            c["mem_mb"] = round((cur - inactive) / 1e6)
+            sw = os.path.join(d, "memory.swap.current")
+            if os.path.exists(sw):
+                c["swap_mb"] = round(_read_cg_int(sw) / 1e6)
+            lim = _read_cg_int(os.path.join(d, "memory.max"))
+            c["mem_limit_mb"] = round(lim / 1e6) if lim else None
+            found += 1
+        except (OSError, ValueError, TypeError):
+            continue
+    if found or not any(c["status"] == "running" for c in containers):
+        return
+    # cgroup 读不到（cgroup v1 等）→ docker stats 兜底，约 2 秒
+    try:
+        out = subprocess.run(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}"],
+                             capture_output=True, text=True, timeout=30, check=True).stdout
+    except Exception:  # noqa
+        return
+    by_name = {c["name"]: c for c in containers}
+    for line in out.splitlines():
+        try:
+            name, usage = line.split("\t", 1)
+            used, limit = usage.split("/", 1)
+            if name in by_name:
+                by_name[name]["mem_mb"] = round(_parse_size(used) / 1e6)
+                by_name[name]["mem_limit_mb"] = round(_parse_size(limit) / 1e6)
+        except ValueError:
+            continue
+
+
+# ----------------------------------------------------------------------------
+# 1c) swap 换入/换出活动（/proc/vmstat 的累计页数 → 速率）
+#     「swap 已用量」只说明曾经换出过；「换页速率」才说明现在是否有内存压力。
+# ----------------------------------------------------------------------------
+PAGE_KB = os.sysconf("SC_PAGE_SIZE") / 1024 if hasattr(os, "sysconf") else 4
+
+
+def read_vmstat():
+    r = {}
+    try:
+        with open("/proc/vmstat") as f:
+            for line in f:
+                k, v = line.split()
+                if k in ("pswpin", "pswpout"):
+                    r[k] = int(v)
+    except (OSError, ValueError):
+        pass
+    return r
+
+
+def _swap_rate(v0, v1, seconds):
+    if seconds <= 0 or not v0 or not v1:
+        return None
+    din, dout = v1.get("pswpin", 0) - v0.get("pswpin", 0), v1.get("pswpout", 0) - v0.get("pswpout", 0)
+    if din < 0 or dout < 0:      # 重启过主机，计数器归零
+        return None
+    return {"in_kbps": round(din * PAGE_KB / seconds, 1), "out_kbps": round(dout * PAGE_KB / seconds, 1)}
+
+
+# ----------------------------------------------------------------------------
+# 1d) 上次巡检的状态（重启次数 / swap 计数器），用于算「增量」而不是看累计值
+# ----------------------------------------------------------------------------
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(prev, containers, collect_ok, vmstat, ts):
+    state = {"ts": ts, "vmstat": vmstat,
+             # 容器采集失败时沿用上次的容器计数，避免下次算出错误增量
+             "containers": ({c["name"]: {"restarts": c["restarts"], "started_at": c["started_at"]}
+                             for c in containers} if collect_ok else prev.get("containers", {}))}
+    os.makedirs(OUT_DIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_FILE)
+
+
+def apply_restart_delta(containers, prev):
+    """restarts_delta = 上次巡检以来新增的重启次数。无上次记录 / 容器被重建（计数归零）时为 None。"""
+    pc = prev.get("containers", {})
+    for c in containers:
+        p = pc.get(c["name"])
+        if p and isinstance(c["restarts"], int) and isinstance(p.get("restarts"), int):
+            d = c["restarts"] - p["restarts"]
+            c["restarts_delta"] = d if d >= 0 else None
+        else:
+            c["restarts_delta"] = None
 
 
 # ----------------------------------------------------------------------------
@@ -301,12 +450,24 @@ def compute_alerts(host, containers, web):
             alerts.append(f"[WARN] 可用内存 {av}GB ≤ {MEM_AVAIL_WARN_GB}GB")
 
     s = host.get("swap", {})
+    sio = host.get("swap_io", {})
+    # 用换页速率给「swap 已用量」加注：已用多但几乎不换页 → 多为历史残留
+    rate = sio.get("since_last") or sio.get("now")
+    hint = ""
+    if rate:
+        tot = rate["in_kbps"] + rate["out_kbps"]
+        hint = (f"（换页 {tot}KB/s，几乎无活动，多为历史换出的残留）" if tot < SWAP_IO_WARN_KBPS / 10
+                else f"（换页 {tot}KB/s，仍在活跃换页）")
     su = s.get("used_gb")
     if isinstance(su, (int, float)):
         if su >= SWAP_CRIT_GB:
-            alerts.append(f"[CRIT] swap 已用 {su}GB ≥ {SWAP_CRIT_GB}GB")
+            alerts.append(f"[CRIT] swap 已用 {su}GB ≥ {SWAP_CRIT_GB}GB{hint}")
         elif su >= SWAP_WARN_GB:
-            alerts.append(f"[WARN] swap 已用 {su}GB ≥ {SWAP_WARN_GB}GB")
+            alerts.append(f"[WARN] swap 已用 {su}GB ≥ {SWAP_WARN_GB}GB{hint}")
+    sl = sio.get("since_last")
+    if sl and sl["in_kbps"] + sl["out_kbps"] >= SWAP_IO_WARN_KBPS:
+        alerts.append(f"[WARN] 上次巡检以来 swap 持续换页：换入 {sl['in_kbps']}KB/s / 换出 {sl['out_kbps']}KB/s"
+                      f"（≥{SWAP_IO_WARN_KBPS}KB/s，存在实际内存压力）")
 
     l = host.get("load", {})
     if isinstance(l.get("per_cpu_1m"), (int, float)) and l["per_cpu_1m"] >= LOAD_PER_CPU_WARN:
@@ -336,9 +497,16 @@ def compute_alerts(host, containers, web):
             continue
         if c["health"] not in ("none", "healthy"):
             alerts.append(f"[WARN] {tag} {c['name']} health={c['health']}")
-        # 只标「最近重启过」，不用无意义的累计次数
+        # 重启只看增量（上次巡检以来），不看无意义的累计次数
+        rd = c.get("restarts_delta")
+        if rd:
+            lv = "CRIT" if rd >= RESTART_DELTA_CRIT else "WARN"
+            why = "，疑似反复崩溃" if lv == "CRIT" else ""
+            alerts.append(f"[{lv}] {tag} {c['name']} 上次巡检以来重启 {rd} 次（累计 {c['restarts']}{why}）")
+            continue
+        # 无增量数据（首次运行等）时，退而标「最近重启过」
         ud = c.get("uptime_days")
-        if isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS:
+        if rd is None and isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS:
             alerts.append(f"[INFO] {tag} {c['name']} 最近重启过（uptime {ud} 天，累计 {c['restarts']} 次）")
 
     for w in web:
@@ -363,9 +531,9 @@ def build_ai_payload(snapshot):
         ud = c.get("uptime_days")
         recent = isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS
         return (c["status"] == "running" and c["health"] in ("healthy", "none")
-                and not c.get("oom_killed") and not recent)
+                and not c.get("oom_killed") and not recent and not c.get("restarts_delta"))
 
-    # notable = 有非常态特征的容器（未运行/不健康/OOM/最近重启）
+    # notable = 有非常态特征的容器（未运行/不健康/OOM/最近重启/上次巡检以来有新重启）
     notable = []
     for c in conts:
         if not is_nominal(c):
@@ -377,7 +545,16 @@ def build_ai_payload(snapshot):
                 "restarts": c["restarts"],
                 "oom_killed": c["oom_killed"],
                 "uptime_days": c.get("uptime_days"),
+                "restarts_delta": c.get("restarts_delta"),
+                "mem_mb": c.get("mem_mb"),
+                "swap_mb": c.get("swap_mb"),
             })
+
+    # 内存占用前 N 名（无论是否异常都发），让 AI 能把内存/swap 问题落到具体容器
+    top_mem = sorted((c for c in conts if isinstance(c.get("mem_mb"), int)),
+                     key=lambda c: c["mem_mb"], reverse=True)[:TOP_MEM_N]
+    top_memory = [{k: c.get(k) for k in ("name", "mem_mb", "swap_mb", "mem_limit_mb")} for c in top_mem]
+    top_swap = sorted((c for c in conts if c.get("swap_mb")), key=lambda c: c["swap_mb"], reverse=True)[:TOP_MEM_N]
 
     total = len(conts)
     running = sum(1 for c in conts if c["status"] == "running")
@@ -389,10 +566,15 @@ def build_ai_payload(snapshot):
                         "not_running": total - running, "nominal": total - len(notable),
                         "ignored": n_ignored},
             "notable": notable,   # 只发值得看的容器，正常的只给计数
+            "top_memory": top_memory,
+            "top_swap": [{"name": c["name"], "swap_mb": c["swap_mb"]} for c in top_swap],
         },
         "web": snapshot["web"],
         "flags": snapshot["alerts"],   # 确定性关注提示
-        "note_for_ai": "flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数，IGNORE_CONTAINERS 中的容器已排除。exit 0 退出的容器多为一次性任务。",
+        "note_for_ai": ("flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数，IGNORE_CONTAINERS 中的容器已排除。"
+                        "exit 0 退出的容器多为一次性任务。restarts 是累计值（长期累积属常态），restarts_delta 才是"
+                        "上次巡检以来的新增重启。host.swap_io 是换页速率：swap 已用量高但换页速率≈0 表示历史残留，"
+                        "不等于当前内存压力。mem_mb/swap_mb 为各容器 cgroup 实测值（MB）。"),
     }
 
 
@@ -500,18 +682,31 @@ def render_markdown(snap, ai_text, generated_at):
     d, m, s, lo = host.get("disk", {}), host.get("mem", {}), host.get("swap", {}), host.get("load", {})
     L.append(f"- ディスク: {d.get('used_pct')}% 使用 ({d.get('used_gb')}/{d.get('total_gb')} GB)")
     L.append(f"- メモリ: {m.get('used_pct')}% 使用 (空き {m.get('available_gb')} GB / 全 {m.get('total_gb')} GB)")
-    L.append(f"- swap: {s.get('used_pct')}% 使用 (全 {s.get('total_gb')} GB)")
+    L.append(f"- swap: {s.get('used_pct')}% 使用 ({s.get('used_gb')}/{s.get('total_gb')} GB)")
+    sio = host.get("swap_io", {})
+    for key, label in (("now", f"直近 {sio.get('now_window_s')} 秒"), ("since_last", f"前回巡検から {sio.get('since_last_min')} 分")):
+        if sio.get(key):
+            L.append(f"- swap 換ページ（{label}）: in {sio[key]['in_kbps']} KB/s / out {sio[key]['out_kbps']} KB/s")
     L.append(f"- load: 1m={lo.get('1m')} 5m={lo.get('5m')} 15m={lo.get('15m')} ({lo.get('cpu_count')} 核, 每核 {lo.get('per_cpu_1m')})")
     L.append("")
     # 容器
     L.append("## コンテナ状態")
     L.append("")
-    L.append("| Container | Watched | Status | Health | Restarts | OOM |")
-    L.append("|-----------|---------|--------|--------|----------|-----|")
+    L.append("Restarts は累計（括弧内は前回巡検からの増分、— は比較データなし）。")
+    L.append("")
+    L.append("| Container | Core | Status | Health | Uptime(d) | Restarts | Mem MB | Swap MB | OOM |")
+    L.append("|-----------|------|--------|--------|-----------|----------|--------|---------|-----|")
+
+    def _v(x):
+        return "—" if x is None else x
+
     for c in containers:
         st = c["status"] + (f" ({c.get('exit_code')})" if c["status"] == "exited" else "")
         mark = "(ignored)" if c.get("ignored") else ("★" if c["watched"] else "")
-        L.append(f"| {c['name']} | {mark} | {st} | {c['health']} | {c['restarts']} | {'⚠️' if c['oom_killed'] else ''} |")
+        rd = c.get("restarts_delta")
+        rs = f"{c['restarts']} ({'+' + str(rd) if rd else _v(rd)})"
+        L.append(f"| {c['name']} | {mark} | {st} | {c['health']} | {_v(c.get('uptime_days'))} | {rs} | "
+                 f"{_v(c.get('mem_mb'))} | {_v(c.get('swap_mb'))} | {'⚠️' if c['oom_killed'] else ''} |")
     L.append("")
     # 网页
     if web:
@@ -551,10 +746,24 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc)
     generated_at = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    t0, vm0 = time.time(), read_vmstat()
+    prev = load_state()
 
     host = collect_host()
     cinfo, containers = collect_containers()
+    collect_container_mem(containers)
+    apply_restart_delta(containers, prev)
     web = collect_web()
+
+    # swap 换页速率：本次运行期间（至少 3 秒窗口）+ 上次巡检以来的平均
+    elapsed = time.time() - t0
+    if elapsed < 3:
+        time.sleep(3 - elapsed)
+    t1, vm1 = time.time(), read_vmstat()
+    host["swap_io"] = {"now": _swap_rate(vm0, vm1, t1 - t0), "now_window_s": round(t1 - t0, 1)}
+    if prev.get("ts") and prev.get("vmstat"):
+        host["swap_io"]["since_last"] = _swap_rate(prev["vmstat"], vm1, t1 - prev["ts"])
+        host["swap_io"]["since_last_min"] = round((t1 - prev["ts"]) / 60)
     if cinfo.get("error"):
         print(f"[warn] 容器采集失败: {cinfo['error']}（可能需要 sudo 运行）", file=sys.stderr)
     alerts = compute_alerts(host, containers, web)
@@ -599,6 +808,7 @@ def main():
     stamp = now.strftime("%Y%m%d_%H%M%S")
     with open(os.path.join(OUT_DIR, f"health_{stamp}.json"), "w", encoding="utf-8") as f:
         json.dump(snapshot, f, ensure_ascii=False, indent=2)
+    save_state(prev, containers, not cinfo.get("error"), vm1, t1)
     with open(os.path.join(OUT_DIR, f"health_{stamp}.md"), "w", encoding="utf-8") as f:
         f.write(md)
     with open(os.path.join(OUT_DIR, "health_latest.md"), "w", encoding="utf-8") as f:
