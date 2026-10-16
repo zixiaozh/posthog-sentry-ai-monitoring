@@ -128,43 +128,55 @@ def _uptime_days(started_at):
         return None
 
 
+def _short(text, n=300):
+    """错误信息只留首尾要点，避免把整条命令/上百行输出塞进报告。"""
+    t = " ".join((text or "").split())
+    return t if len(t) <= n else t[:n] + "…"
+
+
 def collect_containers():
     """用 docker inspect 采集所有容器的关键状态。docker 不可用则返回错误标记。"""
     if shutil.which("docker") is None:
         return {"error": "docker 命令不可用（PATH 中找不到）"}, []
-    # 先列出所有容器名（含已停止）
+    # 先列出所有容器（含已停止）的完整 ID 与名称。ID 从 ps 取：{{.ID}} 是 ps 格式里最通用的写法
     try:
-        names_out = subprocess.run(
-            ["docker", "ps", "-a", "--format", "{{.Names}}"],
+        ps_out = subprocess.run(
+            ["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"],
             capture_output=True, text=True, timeout=20, check=True,
         ).stdout
     except subprocess.CalledProcessError as e:
-        return {"error": f"docker ps 失败：{e.stderr.strip() or e}"}, []
+        return {"error": f"docker ps 失败：{_short(e.stderr) or e.returncode}"}, []
     except Exception as e:  # noqa
         return {"error": f"docker ps 异常：{e}"}, []
 
-    names = [n for n in names_out.splitlines() if n.strip()]
+    ids = {}
+    for line in ps_out.splitlines():
+        if "\t" in line:
+            cid, name = line.split("\t", 1)
+            ids[name.strip()] = cid.strip()
+    names = list(ids)
     if not names:
         return {"error": None, "note": "未发现任何容器"}, []
 
     # 一次 inspect 全部，输出可解析的分隔行
     fmt = ("{{.Name}}\t{{.State.Status}}\t"
            "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}\t"
-           "{{.RestartCount}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}\t{{.State.ExitCode}}\t{{.Id}}")
+           "{{.RestartCount}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}\t{{.State.ExitCode}}")
     try:
-        insp = subprocess.run(
-            ["docker", "inspect", "--format", fmt] + names,
-            capture_output=True, text=True, timeout=30, check=True,
-        ).stdout
+        r = subprocess.run(["docker", "inspect", "--format", fmt] + names,
+                           capture_output=True, text=True, timeout=30)
     except Exception as e:  # noqa
         return {"error": f"docker inspect 异常：{e}"}, []
+    insp = r.stdout
+    # 非 0 退出也先解析已有输出（例如 ps 与 inspect 之间有容器被删掉，只影响那一个）
+    inspect_err = f"docker inspect 失败（exit {r.returncode}）：{_short(r.stderr)}" if r.returncode else None
 
     containers = []
     for line in insp.splitlines():
         if not line.strip():
             continue
         parts = line.split("\t")
-        if len(parts) < 8:
+        if len(parts) < 7:
             continue
         name = parts[0].lstrip("/")
         watched = any(name.startswith(p.strip()) or (p.strip() in name) for p in WATCH_PREFIXES if p.strip())
@@ -179,10 +191,14 @@ def collect_containers():
             "exit_code": int(parts[6]) if parts[6].lstrip("-").isdigit() else None,
             "watched": watched,
             "ignored": any(p in name for p in IGNORE_CONTAINERS),
-            "id": parts[7].strip(),
+            "id": ids.get(name, ""),
         })
     containers.sort(key=lambda c: (not c["watched"], c["name"]))
-    return {"error": None}, containers
+    if inspect_err and not containers:
+        return {"error": inspect_err}, []
+    if inspect_err:
+        print(f"[warn] {inspect_err}（已解析 {len(containers)}/{len(names)} 个容器）", file=sys.stderr)
+    return {"error": None, "partial": inspect_err}, containers
 
 
 # ----------------------------------------------------------------------------
@@ -571,6 +587,7 @@ def build_ai_payload(snapshot):
         },
         "web": snapshot["web"],
         "flags": snapshot["alerts"],   # 确定性关注提示
+        "rule_status": _overall(snapshot["alerts"]),
         "note_for_ai": ("flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数，IGNORE_CONTAINERS 中的容器已排除。"
                         "exit 0 退出的容器多为一次性任务。restarts 是累计值（长期累积属常态），restarts_delta 才是"
                         "上次巡检以来的新增重启。host.swap_io 是换页速率：swap 已用量高但换页速率≈0 表示历史残留，"
@@ -593,6 +610,7 @@ def _system_prompt():
         "数値を捏造しないこと。構成: 1) 総合ステータス(正常/注意/危険を1行で) "
         "2) 検出された異常とその影響 3) 想定原因 4) 推奨アクション(具体的に)。"
         "異常が無ければその旨を明記。前置き・挨拶は不要、1) から書き始めること。"
+        "総合ステータスは rule_status（ルール判定）を基準とし、異なる判断をする場合は根拠を1行で示すこと。"
     )
 
 
@@ -654,9 +672,16 @@ PROVIDERS = {
 # ----------------------------------------------------------------------------
 # 报告渲染 + 落盘 + 清理
 # ----------------------------------------------------------------------------
+def _overall(alerts):
+    # INFO 不影响总合状态
+    if any(a.startswith("[CRIT]") for a in alerts):
+        return "危険"
+    return "注意" if any(a.startswith("[WARN]") for a in alerts) else "正常"
+
+
 def render_markdown(snap, ai_text, generated_at):
     host, containers, web, alerts = snap["host"], snap["containers"], snap["web"], snap["alerts"]
-    overall = "🔴 危険" if any(a.startswith("[CRIT]") for a in alerts) else ("🟡 注意" if alerts else "🟢 正常")
+    overall = {"危険": "🔴 危険", "注意": "🟡 注意", "正常": "🟢 正常"}[_overall(alerts)]
     L = []
     L.append(f"# プラットフォーム健康レポート（Sentry + PostHog）")
     L.append("")
@@ -765,11 +790,13 @@ def main():
         host["swap_io"]["since_last"] = _swap_rate(prev["vmstat"], vm1, t1 - prev["ts"])
         host["swap_io"]["since_last_min"] = round((t1 - prev["ts"]) / 60)
     if cinfo.get("error"):
-        print(f"[warn] 容器采集失败: {cinfo['error']}（可能需要 sudo 运行）", file=sys.stderr)
+        print(f"[warn] 容器采集失败: {cinfo['error']}", file=sys.stderr)
     alerts = compute_alerts(host, containers, web)
     if cinfo.get("error"):
         # 采集不到≠没问题：不能让总合状态显示为 🟢
         alerts.insert(0, f"[WARN] 容器状态采集失败，本次结果不完整：{cinfo['error']}")
+    elif cinfo.get("partial"):
+        alerts.insert(0, f"[WARN] 部分容器状态采集失败：{cinfo['partial']}")
 
     snapshot = {
         "generated_at": generated_at,
