@@ -70,6 +70,27 @@
 - Sentry：`https://sentry.randd-nn-freebit.net/_health/`
 - PostHog：`https://posthog.randd-nn-freebit.net/_health`（EC2 本机实测约 150ms，2026-10）
 
+### 2.4 CloudWatch（来源：`aws cloudwatch get-metric-data` / `describe-alarms`）
+
+本机信号看「容器 / 进程内部」，CloudWatch 看「实例外部」，两者交叉印证。经 aws CLI 调用（Amazon Linux 自带），仍无第三方 Python 依赖。
+
+- 实例 ID / region / 实例类型：从 IMDSv2 自动取得（可用 `CW_INSTANCE_ID` / `AWS_REGION` 覆盖）
+- 一次请求取近 24h、5 分钟粒度的以下指标，汇总为 `latest` 与近 1h / 24h 的 `avg / min / max`：
+
+| 指标 | 统计 | 换算 | 看什么 |
+|------|------|------|--------|
+| CPUUtilization | Average / Maximum | % | 实例整体 CPU |
+| NetworkIn / NetworkOut | Sum | KB/s | 流量异常（突增/归零） |
+| EBSReadBytes / EBSWriteBytes | Sum | KB/s | 磁盘吞吐 |
+| EBSReadOps / EBSWriteOps | Sum | IOPS | 磁盘 IOPS |
+| EBSIOBalance% / EBSByteBalance% | Minimum | % | EBS 突发余额（耗尽后被限速） |
+| CPUCreditBalance | Minimum | credits | 仅 T 系实例 |
+| StatusCheckFailed | Maximum | 0/1 | AWS 状态检查 |
+
+- 告警：列出维度含本实例 ID 的 CloudWatch 告警及其状态（其他项目的告警不列）
+- 所需权限：`cloudwatch:GetMetricData`、`cloudwatch:DescribeAlarms`（见 `iam/cloudwatch-read-policy.json`）
+- 费用：GetMetricData 约 $0.01 / 1000 指标，每次 12 指标，可忽略
+
 ---
 
 ## 3. 阈值与判定规则
@@ -107,6 +128,17 @@
 
 > 累计重启次数**不单独告警，也不作为发给 AI 的依据**（三个月累计几十次是常态，属噪音）；只看**增量**这种真信号。
 > 首次运行只建立基准（`out/state.json`），从第二次起才有增量。
+
+### 3.2b CloudWatch 判定
+
+| 情况 | 级别 |
+|------|------|
+| 近 1h `StatusCheckFailed` = 1 | CRIT |
+| 近 1h CPU 平均 ≥ `CW_CPU_WARN`(默认 80%) | WARN |
+| EBS IO / 吞吐突发余额 ≤ `CW_BALANCE_WARN`(默认 20%) | WARN |
+| CPU credit 余额 ≤ `CW_CPU_CREDIT_WARN`(默认 10，仅 T 系) | WARN |
+| 本实例相关的 CloudWatch 告警处于 ALARM | WARN |
+| CloudWatch 取不到（权限不足 / 非 EC2 / 无 aws CLI） | INFO（本机信号仍完整，不影响总合状态） |
 
 ### 3.3 网页判定
 
@@ -156,6 +188,8 @@
     "top_swap": [ {name,swap_mb}, ... ]
   },
   "web": [ {name,url,status,ok,latency_ms}, ... ],
+  "cloudwatch": { instance_id, region, instance_type, metrics: { cpu: {latest, 1h:{avg,min,max}, 24h:{...}, unit}, ... }, alarms: [...], error },
+  "rule_status": "正常 | 注意 | 危険",
   "flags": [ "[CRIT/WARN/INFO] ...", ... ],
   "note_for_ai": "flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数，..."
 }
@@ -226,6 +260,11 @@ sudo python3 platform_health.py                  # 完整：含 AI 诊断（需 
 | RESTART_DELTA_CRIT | 3 | 上次巡检以来新增重启 ≥N → CRIT（≥1 → WARN） |
 | SWAP_IO_WARN_KBPS | 1024 | 上次巡检以来 swap 换页平均 KB/s 阈值 |
 | TOP_MEM_N | 8 | 发给 AI 的内存 / swap 前 N 名容器 |
+| CLOUDWATCH | 1 | 0 = 不查 CloudWatch |
+| CW_INSTANCE_ID / AWS_REGION | 空（IMDS 自动取） | 覆盖实例 ID / region |
+| CW_CPU_WARN | 80 | 近 1h CPU 平均 % 阈值 |
+| CW_BALANCE_WARN | 20 | EBS 突发余额 % 阈值 |
+| CW_CPU_CREDIT_WARN | 10 | T 系 CPU credit 余额阈值 |
 | AI_PROVIDER | gemini | AI 诊断用哪家：gemini / anthropic |
 | GEMINI_API_KEY / MODEL | 空 / gemini-2.5-pro | Gemini（AI Studio 发行） |
 | ANTHROPIC_API_KEY / MODEL | 空 / claude-sonnet-5-5 | Claude（Anthropic Console 发行，单独计费） |
@@ -244,5 +283,5 @@ sudo python3 platform_health.py                  # 完整：含 AI 诊断（需 
 
 - **层次 2**：用 Sentry 只读 token 查「最新事件时间」，检测摄取停滞（覆盖「issues 没显示」）。
 - **层次 3**：Kafka consumer lag / 队列深度 / worker 日志，查根因（如 export 失败）。
-- 接入 CloudWatch，跨源关联（达成 task「2 个以上数据源统合」）。
+- ~~接入 CloudWatch~~（已实现指标 + 告警，见 2.4；待实例角色授权后生效）。下一步：Cost Explorer。
 - 上 cron + `systemd-run` 资源护栏定期运行。

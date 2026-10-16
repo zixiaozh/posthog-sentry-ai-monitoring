@@ -86,9 +86,10 @@
 - 軽量に履歴保持（任意で SQLite）、AI がトレンドを見られるように（例「ディスクが 3 日で 10% 増、X 日後に満杯予測」）。
 - レベル別アラート：CRIT 時のみ通知。
 
-### 第3ステップ — CloudWatch 接続（task の 2 ソース達成）
+### 第3ステップ — CloudWatch 接続（task の 2 ソース達成）— 🚧 実装済み・IAM 権限待ち
 
-- インスタンス層の指標（CPU、ネットワーク、ディスク IO 等）と長期履歴を取得。
+- ✅ インスタンス層の指標（CPU、ネットワーク、EBS IO・突発余額、CPU credit、状態チェック）と本インスタンスの CloudWatch アラームを取得（aws CLI 経由、依存追加なし）。
+- ⏳ 実行にはインスタンスロール `posthog-sentry-ec2-role` に `iam/cloudwatch-read-policy.json` の権限付与が必要（2026-10 時点で未付与）。
 - AI による横断関連付け：ローカル症状 ↔ クラウド指標（例「taskworker が繰り返し OOM ↔ インスタンスメモリが高止まり」）。
 - task 要件「2 つ以上のデータソース統合」を達成。
 
@@ -138,7 +139,8 @@ posthog-sentry-ai-monitoring/
 ├── README.md                 # 計画書（本ファイル、日本語）
 ├── README.zh.md              # platform_health.py 仕様書（中国語）
 ├── platform_health.py        # ★ 第1ステップ：プラットフォーム健康点検（運用主線）
-├── test_gemini.py            # Gemini API 疎通テスト（主スクリプトには未接続）
+├── test_gemini.py            # Gemini API 疎通テスト
+├── iam/cloudwatch-read-policy.json  # インスタンスロールに付与する最小権限
 ├── .env.example              # 設定テンプレート（cp .env.example .env）
 ├── .gitignore
 ├── .env                      # 実際の設定・API key（コミット対象外）
@@ -155,5 +157,5 @@ posthog-sentry-ai-monitoring/
 - [x] AI 診断を Gemini で確認（`AI_PROVIDER=gemini`、Claude は `AI_PROVIDER=anthropic` + key で切替可）
 - [x] EC2 で初回実行（37 コンテナ全て running、swap 5.5GB で WARN のみ）
 - [~] 第2ステップ：再起動増分・コンテナ別メモリ/swap・換ページ速度は実装済み；長期トレンド、レベル別通知は未着手
-- [ ] 第3ステップ：CloudWatch 接続、横断的関連付け
+- [~] 第3ステップ：CloudWatch 接続は実装済み、IAM 権限付与待ち
 - [ ] cron + `systemd-run` リソースガードで定期実行

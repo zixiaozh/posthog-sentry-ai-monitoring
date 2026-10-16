@@ -106,6 +106,14 @@ OUT_DIR = os.environ.get("OUT_DIR", os.path.join(os.path.dirname(os.path.abspath
 KEEP_DAYS = int(os.environ.get("KEEP_DAYS", "14"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
 STATE_FILE = os.path.join(OUT_DIR, "state.json")   # 上次巡检的计数器（重启次数 / swap 换页），用于算增量
+
+# CloudWatch（经 aws CLI；需要实例角色有 cloudwatch:GetMetricData / cloudwatch:DescribeAlarms）
+CLOUDWATCH = os.environ.get("CLOUDWATCH", "1") != "0"          # 0 = 完全不查 CloudWatch
+CW_INSTANCE_ID = os.environ.get("CW_INSTANCE_ID", "")          # 留空则从 IMDS 自动取
+CW_REGION = os.environ.get("AWS_REGION", "") or os.environ.get("AWS_DEFAULT_REGION", "")  # 留空则从 IMDS 取
+CW_CPU_WARN = float(os.environ.get("CW_CPU_WARN", "80"))        # 近 1h CPU 平均 % ≥ → WARN
+CW_BALANCE_WARN = float(os.environ.get("CW_BALANCE_WARN", "20"))  # EBS IO/Byte 突发余额 % ≤ → WARN（将被限速）
+CW_CPU_CREDIT_WARN = float(os.environ.get("CW_CPU_CREDIT_WARN", "10"))  # T 系 CPU credit 余额 ≤ → WARN
 INSECURE = os.environ.get("WEB_INSECURE", "") == "1"
 
 
@@ -444,10 +452,145 @@ def collect_web():
 
 
 # ----------------------------------------------------------------------------
+# 4) CloudWatch：AWS 侧看到的 EC2 实例指标 + 与本实例相关的 CloudWatch 告警
+#    经 aws CLI 调用（Amazon Linux 自带），保持零第三方依赖。
+#    本机信号看「容器/进程内部」，CloudWatch 看「实例外部」（网络、EBS 限速、状态检查、CPU credit）。
+# ----------------------------------------------------------------------------
+CW_PERIOD = 300   # EC2 基础监控为 5 分钟粒度
+CW_METRICS = [
+    # (query id, MetricName, Stat, 换算, 单位)  换算：None=原值 / "kbps"=Sum 字节÷周期÷1024 / "rate"=Sum÷周期
+    ("cpu", "CPUUtilization", "Average", None, "%"),
+    ("cpu_peak", "CPUUtilization", "Maximum", None, "%"),
+    ("net_in", "NetworkIn", "Sum", "kbps", "KB/s"),
+    ("net_out", "NetworkOut", "Sum", "kbps", "KB/s"),
+    ("ebs_read", "EBSReadBytes", "Sum", "kbps", "KB/s"),
+    ("ebs_write", "EBSWriteBytes", "Sum", "kbps", "KB/s"),
+    ("ebs_read_iops", "EBSReadOps", "Sum", "rate", "IOPS"),
+    ("ebs_write_iops", "EBSWriteOps", "Sum", "rate", "IOPS"),
+    ("ebs_io_balance", "EBSIOBalance%", "Minimum", None, "%"),      # 突发型 EBS 带宽余额（Nitro 小规格）
+    ("ebs_byte_balance", "EBSByteBalance%", "Minimum", None, "%"),
+    ("cpu_credit", "CPUCreditBalance", "Minimum", None, "credits"),  # 仅 T 系实例有
+    ("status_failed", "StatusCheckFailed", "Maximum", None, ""),     # 1 = 系统/实例状态检查失败
+]
+
+
+def _imds(path, token, timeout=2):
+    req = request.Request(f"http://169.254.169.254/latest/{path}", headers={"X-aws-ec2-metadata-token": token})
+    with request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode().strip()
+
+
+def _instance_identity():
+    """(instance_id, region, instance_type)。环境变量优先，其余从 IMDSv2 取；不在 EC2 上则抛异常。"""
+    iid, region, itype = CW_INSTANCE_ID, CW_REGION, None
+    try:
+        tok_req = request.Request("http://169.254.169.254/latest/api/token", method="PUT",
+                                  headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+        with request.urlopen(tok_req, timeout=2) as r:
+            token = r.read().decode()
+        iid = iid or _imds("meta-data/instance-id", token)
+        region = region or _imds("meta-data/placement/region", token)
+        itype = _imds("meta-data/instance-type", token)
+    except Exception as e:  # noqa
+        if not (iid and region):
+            raise RuntimeError(f"无法从 IMDS 取得实例信息（不在 EC2 上？）：{e}")
+    return iid, region, itype
+
+
+def _aws(args, region, timeout=40):
+    try:
+        r = subprocess.run(["aws"] + args + ["--region", region, "--output", "json"],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"aws {args[1]} 超时（{timeout}s）") from None
+    if r.returncode:
+        err = r.stderr
+        if "AccessDenied" in err or "not authorized" in err:
+            raise RuntimeError(f"IAM 权限不足：实例角色缺少 cloudwatch:{_CW_ACTION.get(args[1], args[1])}")
+        raise RuntimeError(f"aws {args[1]} 失败：{_short(err)}")
+    return json.loads(r.stdout or "{}")
+
+
+_CW_ACTION = {"get-metric-data": "GetMetricData", "describe-alarms": "DescribeAlarms"}
+
+
+def _summarize(points, conv):
+    """points: [(ts, value)] 新→旧。返回 latest + 近 1h / 24h 的 avg/min/max（已换算单位）。"""
+    if not points:
+        return None
+    f = (lambda v: v / CW_PERIOD / 1024) if conv == "kbps" else (lambda v: v / CW_PERIOD) if conv == "rate" else (lambda v: v)
+    newest = points[0][0]
+    out = {"latest": round(f(points[0][1]), 1)}
+    for label, hours in (("1h", 1), ("24h", 24)):
+        vals = [f(v) for ts, v in points if (newest - ts).total_seconds() < hours * 3600]
+        if vals:
+            out[label] = {"avg": round(sum(vals) / len(vals), 1), "min": round(min(vals), 1), "max": round(max(vals), 1)}
+    return out
+
+
+def _parse_cw_ts(s):
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def collect_cloudwatch():
+    """返回 None（已用 CLOUDWATCH=0 关闭）或 dict。失败不抛异常，写进 error 字段，其余巡检照常。"""
+    if not CLOUDWATCH:
+        return None
+    cw = {"error": None}
+    if shutil.which("aws") is None:
+        cw["error"] = "aws CLI 不可用（PATH 中找不到）"
+        return cw
+    try:
+        iid, region, itype = _instance_identity()
+    except RuntimeError as e:
+        cw["error"] = str(e)
+        return cw
+    cw.update({"instance_id": iid, "region": region, "instance_type": itype, "period_s": CW_PERIOD})
+
+    # --- 指标：一次 GetMetricData 取 24h 全部（12 指标 × 288 点，远低于单次上限）
+    end = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+    queries = [{"Id": qid, "ReturnData": True,
+                "MetricStat": {"Metric": {"Namespace": "AWS/EC2", "MetricName": name,
+                                          "Dimensions": [{"Name": "InstanceId", "Value": iid}]},
+                               "Period": CW_PERIOD, "Stat": stat}}
+               for qid, name, stat, _, _ in CW_METRICS]
+    try:
+        data = _aws(["cloudwatch", "get-metric-data",
+                     "--metric-data-queries", json.dumps(queries),
+                     "--start-time", (end - dt.timedelta(hours=24)).isoformat(),
+                     "--end-time", end.isoformat(),
+                     "--scan-by", "TimestampDescending"], region)
+        meta = {q[0]: q for q in CW_METRICS}
+        metrics = {}
+        for res in data.get("MetricDataResults", []):
+            qid = res.get("Id")
+            pts = list(zip(map(_parse_cw_ts, res.get("Timestamps", [])), res.get("Values", [])))
+            summ = _summarize(pts, meta[qid][3]) if qid in meta else None
+            if summ:   # 没有数据的指标（如非 T 系没有 CPUCreditBalance）直接省略
+                summ["unit"] = meta[qid][4]
+                metrics[qid] = summ
+        cw["metrics"] = metrics
+    except RuntimeError as e:
+        cw["error"] = str(e)
+        return cw
+
+    # --- 与本实例相关的 CloudWatch 告警（维度含本实例 ID）
+    try:
+        alarms = _aws(["cloudwatch", "describe-alarms"], region).get("MetricAlarms", [])
+        mine = [a for a in alarms if any(d.get("Value") == iid for d in a.get("Dimensions", []))]
+        cw["alarms"] = [{"name": a.get("AlarmName"), "state": a.get("StateValue"),
+                         "metric": a.get("MetricName"), "threshold": a.get("Threshold"),
+                         "reason": _short(a.get("StateReason"), 160)} for a in mine]
+    except RuntimeError as e:
+        cw["alarms_error"] = str(e)   # 告警查不到不影响指标
+    return cw
+
+
+# ----------------------------------------------------------------------------
 # 计算「关注提示」（确定性规则，给 AI 聚焦用；★不是告警通道，实时告警归 slack_alert.sh）
 # 刻意只标真信号，避免与 Slack 重复，也避免累计重启这类噪音。
 # ----------------------------------------------------------------------------
-def compute_alerts(host, containers, web):
+def compute_alerts(host, containers, web, cw=None):
     alerts = []
 
     d = host.get("disk", {})
@@ -532,6 +675,29 @@ def compute_alerts(host, containers, web):
         elif isinstance(w.get("latency_ms"), int) and w["latency_ms"] >= WEB_LATENCY_WARN_MS:
             alerts.append(f"[WARN] 网页 {w['name']} 响应过慢：{w['latency_ms']}ms（≥{WEB_LATENCY_WARN_MS}ms，疑似依赖变慢）")
 
+    if cw is not None:
+        if cw.get("error"):
+            # 数据源缺失不等于平台有问题，本机信号仍完整 → INFO，不影响总合状态
+            alerts.append(f"[INFO] CloudWatch 未取得：{cw['error']}")
+        m = cw.get("metrics", {})
+        sf = m.get("status_failed", {}).get("1h", {})
+        if sf.get("max", 0) >= 1:
+            alerts.append("[CRIT] CloudWatch：近 1h EC2 状态检查失败（StatusCheckFailed=1，AWS 侧硬件/网络或实例 OS 异常）")
+        cpu = m.get("cpu", {}).get("1h", {})
+        if cpu.get("avg", 0) >= CW_CPU_WARN:
+            alerts.append(f"[WARN] CloudWatch：近 1h CPU 平均 {cpu['avg']}% ≥ {CW_CPU_WARN}%（峰值 {m.get('cpu_peak', {}).get('1h', {}).get('max')}%）")
+        for key, label in (("ebs_io_balance", "EBS IO 突发余额"), ("ebs_byte_balance", "EBS 吞吐突发余额")):
+            b = m.get(key)
+            if b and b["latest"] <= CW_BALANCE_WARN:
+                alerts.append(f"[WARN] CloudWatch：{label} {b['latest']}% ≤ {CW_BALANCE_WARN}%（耗尽后磁盘 IO 被限速，"
+                              f"24h 最低 {b.get('24h', {}).get('min')}%）")
+        cc = m.get("cpu_credit")
+        if cc and cc["latest"] <= CW_CPU_CREDIT_WARN:
+            alerts.append(f"[WARN] CloudWatch：CPU credit 余额 {cc['latest']} ≤ {CW_CPU_CREDIT_WARN}（耗尽后 CPU 被限速到基准性能）")
+        for a in cw.get("alarms", []):
+            if a["state"] == "ALARM":
+                alerts.append(f"[WARN] CloudWatch 告警 {a['name']} 处于 ALARM（{a['metric']} 阈值 {a['threshold']}）")
+
     return alerts
 
 
@@ -586,12 +752,15 @@ def build_ai_payload(snapshot):
             "top_swap": [{"name": c["name"], "swap_mb": c["swap_mb"]} for c in top_swap],
         },
         "web": snapshot["web"],
+        "cloudwatch": snapshot.get("cloudwatch"),
         "flags": snapshot["alerts"],   # 确定性关注提示
         "rule_status": _overall(snapshot["alerts"]),
         "note_for_ai": ("flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数，IGNORE_CONTAINERS 中的容器已排除。"
                         "exit 0 退出的容器多为一次性任务。restarts 是累计值（长期累积属常态），restarts_delta 才是"
                         "上次巡检以来的新增重启。host.swap_io 是换页速率：swap 已用量高但换页速率≈0 表示历史残留，"
-                        "不等于当前内存压力。mem_mb/swap_mb 为各容器 cgroup 实测值（MB）。"),
+                        "不等于当前内存压力。mem_mb/swap_mb 为各容器 cgroup 实测值（MB）。"
+                        "cloudwatch 是 AWS 侧看到的本 EC2 实例指标（5 分钟粒度，latest 与近 1h/24h 的 avg/min/max，"
+                        "单位见 unit），用于和本机信号交叉印证；cloudwatch 为 null 表示未启用。"),
     }
 
 
@@ -606,6 +775,8 @@ def _system_prompt():
     return (
         "あなたは SRE / インフラ運用のアシスタントです。以下は自前ホストの "
         "Sentry + PostHog プラットフォーム（EC2 上、Docker 運用）の健康チェック結果です。"
+        "ローカル信号（コンテナ・ホスト）と CloudWatch のインスタンス指標を突き合わせ、"
+        "両者の関連（例: EBS 限速とディスク IO、ネットワークと Web 応答）があれば言及すること。"
         f"{lang} で簡潔な健康レポートを書いてください。与えられたデータのみ使用し、"
         "数値を捏造しないこと。構成: 1) 総合ステータス(正常/注意/危険を1行で) "
         "2) 検出された異常とその影響 3) 想定原因 4) 推奨アクション(具体的に)。"
@@ -742,6 +913,37 @@ def render_markdown(snap, ai_text, generated_at):
         for w in web:
             L.append(f"| {w['name']} | {w.get('status')} | {'✅' if w.get('ok') else '❌'} | {w.get('latency_ms')}ms |")
         L.append("")
+    cw = snap.get("cloudwatch")
+    if cw is not None:
+        L.append("## CloudWatch（EC2 インスタンス指標）")
+        L.append("")
+        if cw.get("instance_id"):
+            L.append(f"- インスタンス: {cw['instance_id']}（{cw.get('instance_type')}, {cw.get('region')}）")
+        if cw.get("error"):
+            L.append(f"- ⚠️ 取得失敗: {cw['error']}")
+        m = cw.get("metrics", {})
+        if m:
+            L.append("")
+            L.append("| Metric | Unit | Latest | 1h avg | 1h max | 24h avg | 24h min | 24h max |")
+            L.append("|--------|------|--------|--------|--------|---------|---------|---------|")
+            for qid, name, stat, _, _ in CW_METRICS:
+                v = m.get(qid)
+                if not v:
+                    continue
+                h1, h24 = v.get("1h", {}), v.get("24h", {})
+                label = f"{name} ({stat})" if name == "CPUUtilization" else name
+                L.append(f"| {label} | {v['unit']} | {v['latest']} | {h1.get('avg', '—')} | {h1.get('max', '—')} | "
+                         f"{h24.get('avg', '—')} | {h24.get('min', '—')} | {h24.get('max', '—')} |")
+        if "alarms" in cw:
+            L.append("")
+            if cw["alarms"]:
+                for a in cw["alarms"]:
+                    L.append(f"- 告警 {a['name']}: **{a['state']}**（{a['metric']} 閾値 {a['threshold']}）")
+            else:
+                L.append("- 本インスタンスに紐づく CloudWatch 告警: なし")
+        if cw.get("alarms_error"):
+            L.append(f"- 告警取得失敗: {cw['alarms_error']}")
+        L.append("")
     return "\n".join(L)
 
 
@@ -791,7 +993,8 @@ def main():
         host["swap_io"]["since_last_min"] = round((t1 - prev["ts"]) / 60)
     if cinfo.get("error"):
         print(f"[warn] 容器采集失败: {cinfo['error']}", file=sys.stderr)
-    alerts = compute_alerts(host, containers, web)
+    cw = collect_cloudwatch()
+    alerts = compute_alerts(host, containers, web, cw)
     if cinfo.get("error"):
         # 采集不到≠没问题：不能让总合状态显示为 🟢
         alerts.insert(0, f"[WARN] 容器状态采集失败，本次结果不完整：{cinfo['error']}")
@@ -804,6 +1007,7 @@ def main():
         "containers": containers,
         "container_collect_error": cinfo.get("error"),
         "web": web,
+        "cloudwatch": cw,
         "alerts": alerts,
     }
 
