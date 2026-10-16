@@ -16,11 +16,11 @@ platform_health.py — 自建 Sentry + PostHog 平台健康巡检（运维视角
 用法：
   # 只巡检+聚合，不调 LLM（先验证采集正常）
   python3 platform_health.py --dry-run
-  # 加 AI 诊断（需要 ANTHROPIC_API_KEY）
+  # 加 AI 诊断（AI_PROVIDER=gemini 需 GEMINI_API_KEY；=anthropic 需 ANTHROPIC_API_KEY）
   python3 platform_health.py
 
 注意：读取 docker 信息通常需要权限。若你平时用 `sudo docker`，
-      则用 `sudo -E python3 platform_health.py`（-E 保留环境变量），
+      则用 `sudo python3 platform_health.py`（.env 由脚本自行读取，无需 -E），
       或把运行用户加入 docker 组。
 """
 
@@ -35,11 +35,36 @@ import datetime as dt
 import ssl
 from urllib import request, error
 
+
+# ----------------------------------------------------------------------------
+# 自动加载同目录 .env（已存在的环境变量优先，不覆盖；空值忽略）
+# 放在读取配置之前；sudo 会清空环境变量，所以由脚本自己读文件最可靠。
+# ----------------------------------------------------------------------------
+def _load_dotenv():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.split(" #", 1)[0].strip().strip('"').strip("'")
+                if v:  # 空值视为未设置，走代码默认值（如 OUT_DIR=）
+                    os.environ.setdefault(k.strip(), v)
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
+
 # ----------------------------------------------------------------------------
 # 配置（环境变量）
 # ----------------------------------------------------------------------------
 # 要重点关注的容器名前缀（用于标记「平台核心容器」）
 WATCH_PREFIXES = os.environ.get("WATCH_PREFIXES", "sentry,posthog,clickhouse,kafka,redis,postgres,snuba").split(",")
+# 完全不参与判定的容器（逗号分隔，名称包含即匹配），用于已知的一次性/废弃容器
+IGNORE_CONTAINERS = [p.strip() for p in os.environ.get("IGNORE_CONTAINERS", "").split(",") if p.strip()]
 
 # 网页探活目标：格式 "名称=URL"，多个用逗号分隔。留空则不做网页检查。
 # 例：SENTRY_URL / POSTHOG_URL 单独给也行
@@ -61,8 +86,11 @@ RECENT_RESTART_DAYS = float(os.environ.get("RECENT_RESTART_DAYS", "1"))  # uptim
 WEB_LATENCY_WARN_MS = int(os.environ.get("WEB_LATENCY_WARN_MS", "5000"))  # 网页/健康端点响应过慢阈值
 
 # AI
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").strip().lower()   # gemini | anthropic
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 REPORT_LANG = os.environ.get("REPORT_LANG", "ja")
 
 # 产物
@@ -113,7 +141,7 @@ def collect_containers():
     # 一次 inspect 全部，输出可解析的分隔行
     fmt = ("{{.Name}}\t{{.State.Status}}\t"
            "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}\t"
-           "{{.RestartCount}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}")
+           "{{.RestartCount}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}\t{{.State.ExitCode}}")
     try:
         insp = subprocess.run(
             ["docker", "inspect", "--format", fmt] + names,
@@ -127,7 +155,7 @@ def collect_containers():
         if not line.strip():
             continue
         parts = line.split("\t")
-        if len(parts) < 6:
+        if len(parts) < 7:
             continue
         name = parts[0].lstrip("/")
         watched = any(name.startswith(p.strip()) or (p.strip() in name) for p in WATCH_PREFIXES if p.strip())
@@ -139,7 +167,9 @@ def collect_containers():
             "oom_killed": parts[4].strip().lower() == "true",
             "started_at": parts[5],
             "uptime_days": _uptime_days(parts[5]),
+            "exit_code": int(parts[6]) if parts[6].lstrip("-").isdigit() else None,
             "watched": watched,
+            "ignored": any(p in name for p in IGNORE_CONTAINERS),
         })
     containers.sort(key=lambda c: (not c["watched"], c["name"]))
     return {"error": None}, containers
@@ -238,8 +268,7 @@ def collect_web():
                 rec["ok"] = 200 <= resp.status < 400
         except error.HTTPError as e:
             rec["status"] = e.code
-            rec["ok"] = 200 <= e.code < 400  # 4xx/5xx 也算「有响应」，但标记 ok=False
-            rec["ok"] = False
+            rec["ok"] = False  # 4xx/5xx 也算「有响应」，但标记 ok=False
         except Exception as e:  # noqa
             rec["status"] = None
             rec["ok"] = False
@@ -284,14 +313,29 @@ def compute_alerts(host, containers, web):
         alerts.append(f"[WARN] 每核 load {l['per_cpu_1m']}（1m {l.get('1m')} / {l.get('cpu_count')} 核）")
 
     for c in containers:
+        if c.get("ignored"):
+            continue
         tag = "核心容器" if c["watched"] else "容器"
-        if c["status"] != "running":
-            alerts.append(f"[CRIT] {tag} {c['name']} 状态为 {c['status']}（未运行）")
+        # OOM 不论当前状态都要报（停掉的容器恰恰可能是被 OOM 杀的）
+        if c.get("oom_killed"):
+            alerts.append(f"[CRIT] {tag} {c['name']} 曾被 OOM kill（status={c['status']}）")
+        st = c["status"]
+        if st != "running":
+            if st == "exited" and c.get("exit_code") == 0:
+                # 正常结束：多为一次性任务（migration 等），不算故障
+                alerts.append(f"[INFO] {tag} {c['name']} 已正常退出（exit 0，可能是一次性任务；"
+                              f"如属预期可加入 IGNORE_CONTAINERS）")
+            elif st == "created":
+                alerts.append(f"[INFO] {tag} {c['name']} 已创建但从未启动（status=created）")
+            elif st == "paused":
+                alerts.append(f"[WARN] {tag} {c['name']} 被暂停（status=paused）")
+            else:
+                # exited≠0 / restarting / dead / removing
+                detail = f"，exit {c.get('exit_code')}" if st == "exited" else ""
+                alerts.append(f"[CRIT] {tag} {c['name']} 未运行（status={st}{detail}）")
             continue
         if c["health"] not in ("none", "healthy"):
             alerts.append(f"[WARN] {tag} {c['name']} health={c['health']}")
-        if c.get("oom_killed"):
-            alerts.append(f"[CRIT] {tag} {c['name']} 曾被 OOM kill")
         # 只标「最近重启过」，不用无意义的累计次数
         ud = c.get("uptime_days")
         if isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS:
@@ -311,22 +355,24 @@ def compute_alerts(host, containers, web):
 # 构建「真正发给 AI 的精简 payload」——本地存全量快照，但只把必要内容喂给 LLM 省 token
 # ----------------------------------------------------------------------------
 def build_ai_payload(snapshot):
-    conts = snapshot["containers"]
+    conts = [c for c in snapshot["containers"] if not c.get("ignored")]
+    n_ignored = len(snapshot["containers"]) - len(conts)
 
     def is_nominal(c):
+        # 累计重启次数不参与判定（长期累积是常态、属噪音）；只看当前状态与「最近重启」
         ud = c.get("uptime_days")
         recent = isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS
         return (c["status"] == "running" and c["health"] in ("healthy", "none")
-                and not c.get("oom_killed") and not recent
-                and (not isinstance(c["restarts"], int) or c["restarts"] == 0))
+                and not c.get("oom_killed") and not recent)
 
-    # notable = 有任何非常态特征的容器（未运行/不健康/OOM/最近重启/有重启历史）
+    # notable = 有非常态特征的容器（未运行/不健康/OOM/最近重启）
     notable = []
     for c in conts:
         if not is_nominal(c):
             notable.append({
                 "name": c["name"],
                 "status": c["status"],
+                "exit_code": c.get("exit_code") if c["status"] == "exited" else None,
                 "health": c["health"],
                 "restarts": c["restarts"],
                 "oom_killed": c["oom_killed"],
@@ -340,12 +386,13 @@ def build_ai_payload(snapshot):
         "host": snapshot["host"],
         "containers": {
             "summary": {"total": total, "running": running,
-                        "not_running": total - running, "nominal": total - len(notable)},
+                        "not_running": total - running, "nominal": total - len(notable),
+                        "ignored": n_ignored},
             "notable": notable,   # 只发值得看的容器，正常的只给计数
         },
         "web": snapshot["web"],
         "flags": snapshot["alerts"],   # 确定性关注提示
-        "note_for_ai": "flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数。",
+        "note_for_ai": "flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数，IGNORE_CONTAINERS 中的容器已排除。exit 0 退出的容器多为一次性任务。",
     }
 
 
@@ -355,33 +402,71 @@ def build_ai_payload(snapshot):
 LANG_LABEL = {"ja": "日本語", "zh": "中文", "en": "English"}
 
 
-def ai_diagnose(snapshot):
+def _system_prompt():
     lang = LANG_LABEL.get(REPORT_LANG, "日本語")
-    system = (
+    return (
         "あなたは SRE / インフラ運用のアシスタントです。以下は自前ホストの "
         "Sentry + PostHog プラットフォーム（EC2 上、Docker 運用）の健康チェック結果です。"
         f"{lang} で簡潔な健康レポートを書いてください。与えられたデータのみ使用し、"
         "数値を捏造しないこと。構成: 1) 総合ステータス(正常/注意/危険を1行で) "
         "2) 検出された異常とその影響 3) 想定原因 4) 推奨アクション(具体的に)。"
-        "異常が無ければその旨を明記。"
+        "異常が無ければその旨を明記。前置き・挨拶は不要、1) から書き始めること。"
     )
+
+
+def _user_content(snapshot):
+    return "健康チェックデータ(JSON):\n" + json.dumps(snapshot, ensure_ascii=False, indent=2)
+
+
+def _post_json(url, payload, headers, timeout):
+    req = request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                          headers={"content-type": "application/json", **headers}, method="POST")
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"HTTP {e.code} {e.reason}: {body}") from None
+
+
+def _diagnose_gemini(snapshot):
+    payload = {
+        "systemInstruction": {"parts": [{"text": _system_prompt()}]},
+        "contents": [{"role": "user", "parts": [{"text": _user_content(snapshot)}]}],
+        # 2.5 系的思考 token 也计入 maxOutputTokens，留足余量以免正文被截断
+        "generationConfig": {"maxOutputTokens": 8192},
+    }
+    data = _post_json(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        payload, {"x-goog-api-key": GEMINI_API_KEY}, timeout=180,
+    )
+    cands = data.get("candidates", [])
+    if not cands:
+        raise RuntimeError(f"Gemini 无候选回复：{json.dumps(data, ensure_ascii=False)[:300]}")
+    parts = cands[0].get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+    if cands[0].get("finishReason") == "MAX_TOKENS":
+        text += "\n\n（※ 出力が上限に達したため途中で切れている可能性あり）"
+    return text
+
+
+def _diagnose_anthropic(snapshot):
     payload = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": 1500,
-        "system": system,
-        "messages": [{"role": "user",
-                      "content": "健康チェックデータ(JSON):\n" + json.dumps(snapshot, ensure_ascii=False, indent=2)}],
+        "max_tokens": 4096,
+        "system": _system_prompt(),
+        "messages": [{"role": "user", "content": _user_content(snapshot)}],
     }
-    req = request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"content-type": "application/json", "x-api-key": ANTHROPIC_API_KEY,
-                 "anthropic-version": "2023-06-01"},
-        method="POST",
-    )
-    with request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    data = _post_json("https://api.anthropic.com/v1/messages", payload,
+                      {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"}, timeout=120)
     return "\n".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+
+
+PROVIDERS = {
+    # name: (诊断函数, 所需 key 的变量名, 模型名)
+    "gemini": (_diagnose_gemini, "GEMINI_API_KEY", GEMINI_MODEL),
+    "anthropic": (_diagnose_anthropic, "ANTHROPIC_API_KEY", ANTHROPIC_MODEL),
+}
 
 
 # ----------------------------------------------------------------------------
@@ -397,7 +482,7 @@ def render_markdown(snap, ai_text, generated_at):
     L.append(f"- 総合ステータス: **{overall}** / 検出アラート: {len(alerts)} 件")
     L.append("")
     if ai_text:
-        L.append("## AI 診断")
+        L.append(f"## AI 診断（{AI_PROVIDER} / {PROVIDERS.get(AI_PROVIDER, (None, None, '?'))[2]}）")
         L.append("")
         L.append(ai_text)
         L.append("")
@@ -424,7 +509,9 @@ def render_markdown(snap, ai_text, generated_at):
     L.append("| Container | Watched | Status | Health | Restarts | OOM |")
     L.append("|-----------|---------|--------|--------|----------|-----|")
     for c in containers:
-        L.append(f"| {c['name']} | {'★' if c['watched'] else ''} | {c['status']} | {c['health']} | {c['restarts']} | {'⚠️' if c['oom_killed'] else ''} |")
+        st = c["status"] + (f" ({c.get('exit_code')})" if c["status"] == "exited" else "")
+        mark = "(ignored)" if c.get("ignored") else ("★" if c["watched"] else "")
+        L.append(f"| {c['name']} | {mark} | {st} | {c['health']} | {c['restarts']} | {'⚠️' if c['oom_killed'] else ''} |")
     L.append("")
     # 网页
     if web:
@@ -469,8 +556,11 @@ def main():
     cinfo, containers = collect_containers()
     web = collect_web()
     if cinfo.get("error"):
-        print(f"[warn] 容器采集失败: {cinfo['error']}（可能需要 sudo -E 运行）", file=sys.stderr)
+        print(f"[warn] 容器采集失败: {cinfo['error']}（可能需要 sudo 运行）", file=sys.stderr)
     alerts = compute_alerts(host, containers, web)
+    if cinfo.get("error"):
+        # 采集不到≠没问题：不能让总合状态显示为 🟢
+        alerts.insert(0, f"[WARN] 容器状态采集失败，本次结果不完整：{cinfo['error']}")
 
     snapshot = {
         "generated_at": generated_at,
@@ -492,11 +582,14 @@ def main():
 
     ai_text = ""
     if not args.dry_run:
-        if not ANTHROPIC_API_KEY:
-            print("[warn] 未设置 ANTHROPIC_API_KEY，跳过 AI 诊断（等同 --dry-run）", file=sys.stderr)
+        prov = PROVIDERS.get(AI_PROVIDER)
+        if prov is None:
+            print(f"[warn] 未知 AI_PROVIDER={AI_PROVIDER}（可选 {'/'.join(PROVIDERS)}），跳过 AI 诊断", file=sys.stderr)
+        elif not globals()[prov[1]]:
+            print(f"[warn] 未设置 {prov[1]}，跳过 AI 诊断（等同 --dry-run）", file=sys.stderr)
         else:
             try:
-                ai_text = ai_diagnose(ai_payload)
+                ai_text = prov[0](ai_payload)
             except Exception as e:  # noqa
                 print(f"[warn] AI 诊断失败: {e}", file=sys.stderr)
 

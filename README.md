@@ -95,9 +95,9 @@
 - レポート配信：Slack / メール / 簡易 Web ダッシュボード。
 - 閾値とサイレンス方針、当番通知 など。
 
-### 派生（運用の主眼外）— Sentry エラー要約（`sentry_report.py`）
+### 派生（運用の主眼外）— Sentry エラー要約（`sentry_report.py`、本リポジトリ未収録）
 
-完成済みの Sentry issues 要約スクリプト。「直近 24h にどのアプリエラーがあったか」を出力。**この系統はアプリチーム向け**で、そのまま引き渡せる。本運用プロジェクトの主線ではない。
+Sentry issues 要約スクリプト（別管理で、本リポジトリには含まれていない）。「直近 24h にどのアプリエラーがあったか」を出力。**この系統はアプリチーム向け**で、そのまま引き渡せる。本運用プロジェクトの主線ではない。
 
 ---
 
@@ -111,7 +111,7 @@
 - **ローカル収集は穏当**：docker inspect / /proc 読み取り / 数回の HTTP 疎通で、プラットフォームサービスへの負荷は無視できる。
 - **ハードガード**：cron で `systemd-run -p MemoryMax=256M -p CPUQuota=50%` + `nice`/`ionice`。
 
-**コスト**：EC2 本体は料金上がらず；唯一の新規費用は **LLM API 呼び出し料**（小さな健康スナップショットのみ送るため 1 日数セント程度）；`--dry-run` では発生しない。
+**コスト**：EC2 本体は料金上がらず；唯一の新規費用は **LLM API 呼び出し料**（`AI_PROVIDER` で Gemini / Claude を切替、既定は Gemini）（小さな健康スナップショットのみ送るため 1 日数セント程度）；`--dry-run` では発生しない。
 
 ---
 
@@ -132,14 +132,14 @@
 ### 推奨ディレクトリ構成
 
 ```
-log-report/
-├── PLAN.md / PLAN.ja.md      # 計画書
-├── README.md                 # 利用手順
+posthog-sentry-ai-monitoring/
+├── README.md                 # 計画書（本ファイル、日本語）
+├── README.zh.md              # platform_health.py 仕様書（中国語）
 ├── platform_health.py        # ★ 第1ステップ：プラットフォーム健康点検（運用主線）
-├── .env.health.example       # health 用設定テンプレート
-├── sentry_report.py          # 派生：アプリエラー要約（アプリチーム向け）
-├── .env.example              # sentry_report 用設定テンプレート
+├── test_gemini.py            # Gemini API 疎通テスト（主スクリプトには未接続）
+├── .env.example              # 設定テンプレート（cp .env.example .env）
 ├── .gitignore
+├── .env                      # 実際の設定・API key（コミット対象外）
 └── out/                      # 実行成果物（コミット対象外）
 ```
 
@@ -149,7 +149,8 @@ log-report/
 
 - [x] プラットフォーム健康点検スクリプト `platform_health.py` 完成
 - [ ] EC2 で `sudo -E python3 platform_health.py --dry-run` を実行し収集を確認
-- [ ] `POSTHOG_URL` を補い Web 疎通を完成；API key を設定し AI 診断を確認
+- [x] `SENTRY_URL` / `POSTHOG_URL` の `/_health` 端点を設定（`.env` は脚本が自動読込）
+- [x] AI 診断を Gemini で確認（`AI_PROVIDER=gemini`、Claude は `AI_PROVIDER=anthropic` + key で切替可）
 - [ ] 第2ステップ：点検の深化（重要エンドポイント疎通、トレンド保持、レベル別アラート）
 - [ ] 第3ステップ：CloudWatch 接続、横断的関連付け
 - [ ] cron + `systemd-run` リソースガードで定期実行

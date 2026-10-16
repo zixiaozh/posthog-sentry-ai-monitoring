@@ -77,12 +77,17 @@
 
 | 情况 | 级别 |
 |------|------|
-| `status` ≠ running（未运行） | CRIT |
-| `health` ∈ {unhealthy, starting…}（非 healthy/none） | WARN |
-| `oom_killed` = true | CRIT |
-| `uptime_days` < `RECENT_RESTART_DAYS`(默认 1)＝最近重启过 | INFO |
+| `oom_killed` = true（**不论当前是否在运行**） | CRIT |
+| `exited` 且 exit code ≠ 0 / `restarting` / `dead` | CRIT |
+| `exited` 且 exit code = 0（正常结束，多为一次性任务） | INFO |
+| `created`（创建后从未启动） | INFO |
+| `paused` | WARN |
+| running 但 `health` ∈ {unhealthy, starting…}（非 healthy/none） | WARN |
+| running 且 `uptime_days` < `RECENT_RESTART_DAYS`(默认 1)＝最近重启过 | INFO |
+| 名称匹配 `IGNORE_CONTAINERS` | 不判定、不发给 AI |
+| docker 本身采集失败（权限等） | WARN（避免误显示 🟢） |
 
-> 累计重启次数**不单独告警**（三个月累计几十次是常态，属噪音）；只标「最近才重启」这种真信号。
+> 累计重启次数**不单独告警，也不作为发给 AI 的依据**（三个月累计几十次是常态，属噪音）；只标「最近才重启」这种真信号。
 
 ### 3.3 网页判定
 
@@ -106,13 +111,14 @@
 ### 4.1 容器折叠
 
 - **正常容器（nominal）折叠为计数**，不逐条发送。
-  nominal 判定 = running 且 health∈{healthy,none} 且 未 OOM 且 非最近重启 且 restarts=0。
-- **只发 notable 容器**：不满足 nominal，或 restarts>0（有重启历史值得看）。
-- 折叠信息：`summary = { total, running, not_running, nominal }`。
+  nominal 判定 = running 且 health∈{healthy,none} 且 未 OOM 且 非最近重启（累计 restarts 不参与）。
+- **只发 notable 容器**：不满足 nominal 的。
+- `IGNORE_CONTAINERS` 中的容器完全排除，只计数。
+- 折叠信息：`summary = { total, running, not_running, nominal, ignored }`。
 
 ### 4.2 字段裁剪
 
-发给 AI 的 notable 容器只保留：`name / status / health / restarts / oom_killed / uptime_days`。
+发给 AI 的 notable 容器只保留：`name / status / exit_code（仅 exited 时）/ health / restarts / oom_killed / uptime_days`。
 去掉：`watched`（冗余）、`started_at`（纳秒时间戳，已由 uptime_days 表达）。
 
 ### 4.3 AI payload 结构
@@ -122,12 +128,12 @@
   "generated_at": "...",
   "host": { disk, mem, swap, load },
   "containers": {
-    "summary": { total, running, not_running, nominal },
-    "notable": [ {name,status,health,restarts,oom_killed,uptime_days}, ... ]
+    "summary": { total, running, not_running, nominal, ignored },
+    "notable": [ {name,status,exit_code,health,restarts,oom_killed,uptime_days}, ... ]
   },
   "web": [ {name,url,status,ok,latency_ms}, ... ],
   "flags": [ "[CRIT/WARN/INFO] ...", ... ],
-  "note_for_ai": "flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数。"
+  "note_for_ai": "flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数，..."
 }
 ```
 
@@ -135,8 +141,8 @@
 
 ### 4.4 AI 诊断（可选）
 
-设 `ANTHROPIC_API_KEY` 后，把上面 payload 交给 Claude，要求用 `REPORT_LANG`（默认 ja）输出：
-① 总合状态一行 ② 检测到的异常与影响 ③ 想定原因 ④ 推奨アクション。未设 key 则跳过，仅出规则 flags。
+按 `AI_PROVIDER` 选择模型（默认 `gemini`，需 `GEMINI_API_KEY`；`anthropic` 需 `ANTHROPIC_API_KEY`），把上面 payload 交给 AI，要求用 `REPORT_LANG`（默认 ja）输出：
+① 总合状态一行 ② 检测到的异常与影响 ③ 想定原因 ④ 推奨アクション。对应 key 未设则跳过，仅出规则 flags。报告中的「AI 診断」标题会注明所用 provider / 模型。
 
 ---
 
@@ -168,16 +174,16 @@
 ## 7. 运行与配置
 
 ```bash
-cd ~/work/log-report
-cp .env.health.example .env      # ★ 脚本读的是 .env，不是 .env.health.example
+cd posthog-sentry-ai-monitoring
+cp .env.example .env             # ★ 脚本读的是 .env，不是 .env.example
 sudo python3 platform_health.py --show-payload   # 只看 payload，不调 AI
 sudo python3 platform_health.py --dry-run --stdout  # 看渲染报告，写 out/
 sudo python3 platform_health.py                  # 完整：含 AI 诊断（需 API key）
 ```
 
-- 脚本**自动加载同目录 `.env`**；命令行/环境变量传入的值优先覆盖。
+- 脚本**自动加载同目录 `.env`**（因此 `sudo` 清空环境变量也不影响）；已存在的环境变量优先，`.env` 中的空值视为未设置。
 - 读容器信息需权限，故用 `sudo`。
-- 常用配置项见 `.env.health.example`（URL、阈值、语言、保留天数等）。
+- 常用配置项见 `.env.example`（URL、阈值、语言、保留天数等）。
 
 ### 主要环境变量
 
@@ -186,12 +192,15 @@ sudo python3 platform_health.py                  # 完整：含 AI 诊断（需 
 | SENTRY_URL / POSTHOG_URL | 已填健康端点 | 网页探活目标 |
 | WEB_LATENCY_WARN_MS | 5000 | 网页响应过慢阈值 |
 | WATCH_PREFIXES | sentry,posthog,clickhouse,kafka,redis,postgres,snuba | 核心容器名前缀 |
+| IGNORE_CONTAINERS | 空 | 完全排除判定的容器（名称包含即匹配） |
 | DISK_WARN / DISK_CRIT | 85 / 95 | 磁盘阈值 % |
 | MEM_AVAIL_WARN_GB / _CRIT_GB | 2 / 1 | 可用内存阈值 GB |
 | SWAP_WARN_GB / _CRIT_GB | 5 / 10 | swap 已用阈值 GB |
 | LOAD_PER_CPU_WARN | 1.5 | 每核 load |
 | RECENT_RESTART_DAYS | 1 | 「最近重启」判定天数 |
-| ANTHROPIC_API_KEY / MODEL | 空 / claude-sonnet-4-5 | AI 诊断 |
+| AI_PROVIDER | gemini | AI 诊断用哪家：gemini / anthropic |
+| GEMINI_API_KEY / MODEL | 空 / gemini-2.5-pro | Gemini（AI Studio 发行） |
+| ANTHROPIC_API_KEY / MODEL | 空 / claude-sonnet-5-5 | Claude（Anthropic Console 发行，单独计费） |
 | REPORT_LANG | ja | 报告语言 ja/zh/en |
 | KEEP_DAYS | 14 | 产物保留天数 |
 
