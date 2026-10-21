@@ -33,6 +33,10 @@ import argparse
 import subprocess
 import datetime as dt
 import ssl
+import math
+import re
+import socket
+import fcntl
 from urllib import request, error
 
 
@@ -83,7 +87,7 @@ DISK_WARN = float(os.environ.get("DISK_WARN", "85"))          # 磁盘使用率 
 DISK_CRIT = float(os.environ.get("DISK_CRIT", "95"))          # 同 Slack DISK_CRIT_PCT
 MEM_AVAIL_WARN_GB = float(os.environ.get("MEM_AVAIL_WARN_GB", "2"))  # 可用内存 < N GB（同 Slack RAM_WARN_GB）
 MEM_AVAIL_CRIT_GB = float(os.environ.get("MEM_AVAIL_CRIT_GB", "1"))  # 同 Slack RAM_CRIT_GB
-SWAP_WARN_GB = float(os.environ.get("SWAP_WARN_GB", "5"))     # swap 已用 > N GB（同 Slack SWAP_WARN_GB）
+SWAP_WARN_GB = float(os.environ.get("SWAP_WARN_GB", "8"))     # swap 已用 ≥ N GiB（同 Slack SWAP_WARN_GB）
 SWAP_CRIT_GB = float(os.environ.get("SWAP_CRIT_GB", "10"))    # 同 Slack SWAP_CRIT_GB
 LOAD_PER_CPU_WARN = float(os.environ.get("LOAD_PER_CPU_WARN", "1.5"))  # 每核 load
 RECENT_RESTART_DAYS = float(os.environ.get("RECENT_RESTART_DAYS", "1"))  # uptime < N 天视为「最近重启」
@@ -99,6 +103,7 @@ DISK_FORECAST_WARN_DAYS = float(os.environ.get("DISK_FORECAST_WARN_DAYS", "30"))
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").strip().lower()   # gemini | anthropic
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")  # 主模型重试仍失败时改用（空=不降级）
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 REPORT_LANG = os.environ.get("REPORT_LANG", "ja")
@@ -107,6 +112,22 @@ REPORT_LANG = os.environ.get("REPORT_LANG", "ja")
 OUT_DIR = os.environ.get("OUT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "out"))
 KEEP_DAYS = int(os.environ.get("KEEP_DAYS", "14"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
+# slack_alert.sh 里给部分容器设的内存阈值（GiB），格式同其 CONTAINERS 数组；改动时两边一起改
+CONTAINER_MEM_BUDGETS = os.environ.get(
+    "CONTAINER_MEM_BUDGETS",
+    "posthog-web-1:5,posthog-clickhouse-1:2,sentry-self-hosted-web-1:1.5,sentry-self-hosted-snuba-api-1:2")
+BUDGET_INFO_PCT = float(os.environ.get("BUDGET_INFO_PCT", "80"))   # 占阈值 ≥ N% → INFO（Slack 在 95% 持续时实时报）
+
+# nginx 访问日志的 5xx 统计（窗口 = 上次巡检以来，最长 NGINX_MAX_WINDOW_H 小时）
+NGINX_CONTAINERS = [c.strip() for c in os.environ.get("NGINX_CONTAINERS", "sentry-self-hosted-nginx-1").split(",") if c.strip()]
+NGINX_MAX_WINDOW_H = float(os.environ.get("NGINX_MAX_WINDOW_H", "24"))
+NGINX_5XX_WARN_PCT = float(os.environ.get("NGINX_5XX_WARN_PCT", "1"))    # 5xx 占比 ≥ N% 且
+NGINX_5XX_WARN_MIN = int(os.environ.get("NGINX_5XX_WARN_MIN", "20"))     # 件数 ≥ N → WARN；否则有 5xx 只记 INFO
+
+# Slack 通知：只在状态变化时发（WARN/CRIT 新增或消除、总合状态改变）。留空则不发
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+
+GIB, MIB = 1024 ** 3, 1024 ** 2   # 容量统一用二进制单位（同 docker stats / df -h / slack_alert.sh）
 STATE_FILE = os.path.join(OUT_DIR, "state.json")   # 上次巡检的计数器（重启次数 / swap 换页），用于算增量
 
 # CloudWatch（经 aws CLI；需要实例角色有 cloudwatch:GetMetricData / cloudwatch:DescribeAlarms）
@@ -216,16 +237,17 @@ def collect_containers():
 # ----------------------------------------------------------------------------
 def collect_host():
     host = {}
-    # 磁盘（根分区）
+    # 磁盘（根分区）。口径同 `df`（slack_alert.sh 用的就是 df 的 Use%）：
+    #   used = 总块 - 空闲块；Use% = ceil(used / (used + 普通用户可用))，保留块不计入分母
     try:
         st = os.statvfs("/")
-        total = st.f_blocks * st.f_frsize
-        free = st.f_bavail * st.f_frsize
-        used = total - free
+        used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        avail = st.f_bavail * st.f_frsize
         host["disk"] = {
-            "total_gb": round(total / 1e9, 1),
-            "used_gb": round(used / 1e9, 1),
-            "used_pct": round(used / total * 100, 1) if total else None,
+            "total_gib": round(st.f_blocks * st.f_frsize / GIB, 1),
+            "used_gib": round(used / GIB, 1),
+            "avail_gib": round(avail / GIB, 1),
+            "used_pct": math.ceil(used * 100 / (used + avail)) if used + avail else None,
         }
     except Exception as e:  # noqa
         host["disk"] = {"error": str(e)}
@@ -239,16 +261,16 @@ def collect_host():
                 mi[k.strip()] = int(v.strip().split()[0])
         mem_total = mi.get("MemTotal", 0)
         mem_avail = mi.get("MemAvailable", 0)
-        host["mem"] = {
-            "total_gb": round(mem_total / 1e6, 1),
-            "available_gb": round(mem_avail / 1e6, 1),
+        host["mem"] = {   # /proc/meminfo 为 KiB → GiB（同 slack_alert.sh 的 ÷1048576）
+            "total_gib": round(mem_total / 1048576, 1),
+            "available_gib": round(mem_avail / 1048576, 2),
             "used_pct": round((mem_total - mem_avail) / mem_total * 100, 1) if mem_total else None,
         }
         sw_total = mi.get("SwapTotal", 0)
         sw_free = mi.get("SwapFree", 0)
         host["swap"] = {
-            "total_gb": round(sw_total / 1e6, 1),
-            "used_gb": round((sw_total - sw_free) / 1e6, 1),
+            "total_gib": round(sw_total / 1048576, 1),
+            "used_gib": round((sw_total - sw_free) / 1048576, 2),
             "used_pct": round((sw_total - sw_free) / sw_total * 100, 1) if sw_total else 0,
         }
     except Exception as e:  # noqa
@@ -295,7 +317,7 @@ def _parse_size(text):
 
 
 def collect_container_mem(containers):
-    """给运行中容器补上 mem_mb / swap_mb / mem_limit_mb（口径同 docker stats：memory.current - inactive_file）。"""
+    """给运行中容器补上 mem_mib / swap_mib / mem_limit_mib（口径同 docker stats：memory.current - inactive_file）。"""
     found = 0
     for c in containers:
         if c["status"] != "running" or not c.get("id"):
@@ -311,12 +333,12 @@ def collect_container_mem(containers):
                     if line.startswith("inactive_file "):
                         inactive = int(line.split()[1])
                         break
-            c["mem_mb"] = round((cur - inactive) / 1e6)
+            c["mem_mib"] = round((cur - inactive) / MIB)
             sw = os.path.join(d, "memory.swap.current")
             if os.path.exists(sw):
-                c["swap_mb"] = round(_read_cg_int(sw) / 1e6)
+                c["swap_mib"] = round(_read_cg_int(sw) / MIB)
             lim = _read_cg_int(os.path.join(d, "memory.max"))
-            c["mem_limit_mb"] = round(lim / 1e6) if lim else None
+            c["mem_limit_mib"] = round(lim / MIB) if lim else None
             found += 1
         except (OSError, ValueError, TypeError):
             continue
@@ -334,10 +356,26 @@ def collect_container_mem(containers):
             name, usage = line.split("\t", 1)
             used, limit = usage.split("/", 1)
             if name in by_name:
-                by_name[name]["mem_mb"] = round(_parse_size(used) / 1e6)
-                by_name[name]["mem_limit_mb"] = round(_parse_size(limit) / 1e6)
+                by_name[name]["mem_mib"] = round(_parse_size(used) / MIB)
+                by_name[name]["mem_limit_mib"] = round(_parse_size(limit) / MIB)
         except ValueError:
             continue
+
+
+def apply_mem_budgets(containers):
+    budgets = {}
+    for item in CONTAINER_MEM_BUDGETS.split(","):
+        if ":" in item:
+            n, g = item.rsplit(":", 1)
+            try:
+                budgets[n.strip()] = float(g)
+            except ValueError:
+                pass
+    for c in containers:
+        b = budgets.get(c["name"])
+        if b and isinstance(c.get("mem_mib"), int):
+            c["budget_gib"] = b
+            c["budget_pct"] = round(c["mem_mib"] * MIB * 100 / (b * GIB))
 
 
 # ----------------------------------------------------------------------------
@@ -380,8 +418,8 @@ def load_state():
         return {}
 
 
-def save_state(prev, containers, collect_ok, vmstat, ts, disk_history):
-    state = {"ts": ts, "vmstat": vmstat, "disk_history": disk_history,
+def save_state(prev, containers, collect_ok, vmstat, ts, disk_history, notify):
+    state = {"ts": ts, "vmstat": vmstat, "disk_avail_history": disk_history, "notify": notify,
              # 容器采集失败时沿用上次的容器计数，避免下次算出错误增量
              "containers": ({c["name"]: {"restarts": c["restarts"], "started_at": c["started_at"]}
                              for c in containers} if collect_ok else prev.get("containers", {}))}
@@ -412,6 +450,7 @@ def apply_restart_delta(containers, prev):
 # 1e) 磁盘增速与到达阈值的预测（样本存 state.json；首次时从 out/ 里的历史快照补种）
 # ----------------------------------------------------------------------------
 def _seed_disk_history():
+    """从 out/ 的历史快照补种「可用空间 GiB」样本。兼容旧格式（十进制 GB 的 total_gb/used_gb）。"""
     hist = []
     try:
         names = sorted(n for n in os.listdir(OUT_DIR) if n.startswith("health_2") and n.endswith(".json"))
@@ -421,37 +460,39 @@ def _seed_disk_history():
         try:
             ts = dt.datetime.strptime(n[7:22], "%Y%m%d_%H%M%S").replace(tzinfo=dt.timezone.utc).timestamp()
             with open(os.path.join(OUT_DIR, n), encoding="utf-8") as f:
-                used = json.load(f)["host"]["disk"]["used_gb"]
-            hist.append([ts, used])
+                d = json.load(f)["host"]["disk"]
+            avail = d["avail_gib"] if "avail_gib" in d else (d["total_gb"] - d["used_gb"]) * 1e9 / GIB
+            hist.append([ts, round(avail, 2)])
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return hist
 
 
 def update_disk_history(prev, disk, ts):
-    hist = prev.get("disk_history") or _seed_disk_history()
-    if isinstance(disk.get("used_gb"), (int, float)):
-        hist.append([ts, disk["used_gb"]])
+    # 记录「可用空间」而不是「已用量」：不受口径（是否计保留块）和单位变化影响，曲线不会断
+    hist = prev.get("disk_avail_history") or _seed_disk_history()
+    if isinstance(disk.get("avail_gib"), (int, float)):
+        hist.append([ts, disk["avail_gib"]])
     cutoff = ts - DISK_TREND_DAYS * 86400
     return [h for h in hist if h[0] >= cutoff]
 
 
 def disk_trend(hist, disk):
-    """最小二乘求 GB/天，并预测到达 DISK_WARN / DISK_CRIT 的天数。样本跨度不足 12 小时则不算。"""
-    total = disk.get("total_gb")
-    if len(hist) < 2 or not total or hist[-1][0] - hist[0][0] < 12 * 3600:
+    """最小二乘求每天消耗的 GiB，并预测 Use%（df 口径）到达 DISK_WARN / DISK_CRIT 的天数。样本跨度不足 12 小时则不算。"""
+    used, avail = disk.get("used_gib"), disk.get("avail_gib")
+    if len(hist) < 2 or used is None or avail is None or hist[-1][0] - hist[0][0] < 12 * 3600:
         return None
     xs = [(t - hist[0][0]) / 86400 for t, _ in hist]
-    ys = [u for _, u in hist]
+    ys = [a for _, a in hist]
     mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
     var = sum((x - mx) ** 2 for x in xs)
-    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var
-    out = {"gb_per_day": round(slope, 2), "span_days": round(xs[-1], 1), "points": len(hist)}
-    now_used = ys[-1]
+    growth = -sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var   # 可用空间减少速度 = 增长速度
+    out = {"gib_per_day": round(growth, 2), "span_days": round(xs[-1], 1), "points": len(hist)}
+    cap = used + avail     # df 的 Use% 分母
     for key, pct in (("warn", DISK_WARN), ("crit", DISK_CRIT)):
-        remain = total * pct / 100 - now_used
-        if slope > 0.01 and remain > 0:
-            days = remain / slope
+        remain = avail - cap * (1 - pct / 100)
+        if growth > 0.01 and remain > 0:
+            days = remain / growth
             out[f"days_to_{key}"] = round(days)
             out[f"eta_{key}"] = (dt.datetime.fromtimestamp(hist[-1][0], dt.timezone.utc)
                                  + dt.timedelta(days=days)).strftime("%Y-%m-%d")
@@ -505,6 +546,56 @@ def collect_web():
         rec["latency_ms"] = int((time.time() - t0) * 1000)
         results.append(rec)
     return results
+
+
+# ----------------------------------------------------------------------------
+# 3b) nginx 访问日志：窗口内请求数与 5xx（流式计数，内存有界）
+#     路径去掉 query（Sentry 的上报 URL 带 sentry_key），数字段归一为 {n} 便于聚合
+# ----------------------------------------------------------------------------
+_ACCESS_RE = re.compile(r'"([A-Z]+) (\S+) [^"]*" (\d{3}) ')
+
+
+def _norm_path(path):
+    path = path.split("?", 1)[0]
+    return re.sub(r"/[0-9a-f]{16,}|/\d+", lambda m: "/{id}" if len(m.group()) > 12 else "/{n}", path)[:80]
+
+
+def collect_nginx(window_s):
+    out = []
+    for name in NGINX_CONTAINERS:
+        rec = {"container": name, "window_h": round(window_s / 3600, 1)}
+        try:
+            proc = subprocess.Popen(["docker", "logs", "--since", f"{int(window_s)}s", name],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+            total = n5 = 0
+            codes, paths = {}, {}
+            deadline = time.time() + 60
+            for line in proc.stdout:
+                m = _ACCESS_RE.search(line)
+                if not m:
+                    continue
+                total += 1
+                if m.group(3).startswith("5"):
+                    n5 += 1
+                    codes[m.group(3)] = codes.get(m.group(3), 0) + 1
+                    key = f"{m.group(1)} {_norm_path(m.group(2))}"
+                    if key in paths or len(paths) < 200:
+                        paths[key] = paths.get(key, 0) + 1
+                if time.time() > deadline:
+                    proc.kill()
+                    rec["truncated"] = True
+                    break
+            proc.wait(timeout=10)
+            if proc.returncode not in (0, None, -9) and total == 0:
+                raise RuntimeError(f"docker logs exit {proc.returncode}")
+            rec.update({"requests": total, "5xx": n5,
+                        "5xx_pct": round(n5 * 100 / total, 2) if total else 0.0,
+                        "by_code": codes,
+                        "top_paths": sorted(paths.items(), key=lambda kv: -kv[1])[:5]})
+        except Exception as e:  # noqa
+            rec["error"] = _short(str(e))
+        out.append(rec)
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -646,7 +737,7 @@ def collect_cloudwatch():
 # 计算「关注提示」（确定性规则，给 AI 聚焦用；★不是告警通道，实时告警归 slack_alert.sh）
 # 刻意只标真信号，避免与 Slack 重复，也避免累计重启这类噪音。
 # ----------------------------------------------------------------------------
-def compute_alerts(host, containers, web, cw=None):
+def compute_alerts(host, containers, web, cw=None, nginx=None):
     alerts = []
 
     d = host.get("disk", {})
@@ -657,16 +748,16 @@ def compute_alerts(host, containers, web, cw=None):
             alerts.append(f"[WARN] 磁盘使用率 {d['used_pct']}% ≥ {DISK_WARN}%")
     tr = host.get("disk_trend") or {}
     if "days_to_warn" in tr and tr["days_to_warn"] <= DISK_FORECAST_WARN_DAYS:
-        alerts.append(f"[WARN] 磁盘按 +{tr['gb_per_day']}GB/天 增长，约 {tr['days_to_warn']} 天后（{tr['eta_warn']} 前后）"
+        alerts.append(f"[WARN] 磁盘按 +{tr['gib_per_day']}GiB/天 增长，约 {tr['days_to_warn']} 天后（{tr['eta_warn']} 前后）"
                       f"达到 {DISK_WARN}%")
 
     m = host.get("mem", {})
-    av = m.get("available_gb")
+    av = m.get("available_gib")
     if isinstance(av, (int, float)):
-        if av <= MEM_AVAIL_CRIT_GB:
-            alerts.append(f"[CRIT] 可用内存仅 {av}GB ≤ {MEM_AVAIL_CRIT_GB}GB")
-        elif av <= MEM_AVAIL_WARN_GB:
-            alerts.append(f"[WARN] 可用内存 {av}GB ≤ {MEM_AVAIL_WARN_GB}GB")
+        if av < MEM_AVAIL_CRIT_GB:      # slack_alert.sh：floor(GiB) < 阈值 ⇔ GiB < 阈值
+            alerts.append(f"[CRIT] 可用内存仅 {av}GiB < {MEM_AVAIL_CRIT_GB}GiB")
+        elif av < MEM_AVAIL_WARN_GB:
+            alerts.append(f"[WARN] 可用内存 {av}GiB < {MEM_AVAIL_WARN_GB}GiB")
 
     s = host.get("swap", {})
     sio = host.get("swap_io", {})
@@ -679,14 +770,14 @@ def compute_alerts(host, containers, web, cw=None):
         idle = tot < SWAP_IO_WARN_KBPS / 10
         hint = (f"（换页 {tot}KB/s，几乎无活动，多为历史换出的残留，已降级）" if idle
                 else f"（换页 {tot}KB/s，仍在活跃换页）")
-    su = s.get("used_gb")
+    su = s.get("used_gib")
     if isinstance(su, (int, float)):
         # 闲置的 swap 不影响性能：降一级（WARN→INFO、CRIT→WARN），避免每次都报成噪音。
         # Slack 的绝对阈值告警不受影响；真正的内存压力由下面的「持续换页」规则负责。
         if su >= SWAP_CRIT_GB:
-            alerts.append(f"[{'WARN' if idle else 'CRIT'}] swap 已用 {su}GB ≥ {SWAP_CRIT_GB}GB{hint}")
+            alerts.append(f"[{'WARN' if idle else 'CRIT'}] swap 已用 {su}GiB ≥ {SWAP_CRIT_GB}GiB{hint}")
         elif su >= SWAP_WARN_GB:
-            alerts.append(f"[{'INFO' if idle else 'WARN'}] swap 已用 {su}GB ≥ {SWAP_WARN_GB}GB{hint}")
+            alerts.append(f"[{'INFO' if idle else 'WARN'}] swap 已用 {su}GiB ≥ {SWAP_WARN_GB}GiB{hint}")
     sl = sio.get("since_last")
     if sl and sl["in_kbps"] + sl["out_kbps"] >= SWAP_IO_WARN_KBPS:
         alerts.append(f"[WARN] 上次巡检以来 swap 持续换页：换入 {sl['in_kbps']}KB/s / 换出 {sl['out_kbps']}KB/s"
@@ -720,6 +811,9 @@ def compute_alerts(host, containers, web, cw=None):
             continue
         if c["health"] not in ("none", "healthy"):
             alerts.append(f"[WARN] {tag} {c['name']} health={c['health']}")
+        if c.get("budget_pct") is not None and c["budget_pct"] >= BUDGET_INFO_PCT:
+            alerts.append(f"[INFO] {tag} {c['name']} 内存 {c['mem_mib']}MiB，已达 Slack 阈值 {c['budget_gib']}GiB 的 "
+                          f"{c['budget_pct']}%（≥95% 持续时 Slack 实时报警）")
         # 重启只看增量（上次巡检以来），不看无意义的累计次数
         rd = c.get("restarts_delta")
         if rd:
@@ -742,6 +836,15 @@ def compute_alerts(host, containers, web, cw=None):
             alerts.append(f"[CRIT] 网页 {w['name']} 探活失败：{detail}")
         elif isinstance(w.get("latency_ms"), int) and w["latency_ms"] >= WEB_LATENCY_WARN_MS:
             alerts.append(f"[WARN] 网页 {w['name']} 响应过慢：{w['latency_ms']}ms（≥{WEB_LATENCY_WARN_MS}ms，疑似依赖变慢）")
+
+    for n in nginx or []:
+        if n.get("error"):
+            alerts.append(f"[INFO] nginx 日志 {n['container']} 未取得：{n['error']}")
+        elif n.get("5xx"):
+            lv = "WARN" if n["5xx"] >= NGINX_5XX_WARN_MIN and n["5xx_pct"] >= NGINX_5XX_WARN_PCT else "INFO"
+            codes = ", ".join(f"{k}×{v}" for k, v in sorted(n["by_code"].items()))
+            alerts.append(f"[{lv}] nginx {n['container']} 近 {n['window_h']}h 5xx {n['5xx']} 件 / {n['requests']} 请求"
+                          f"（{n['5xx_pct']}%：{codes}）")
 
     if cw is not None:
         if cw.get("error"):
@@ -799,15 +902,19 @@ def build_ai_payload(snapshot):
                 "restarts_delta": c.get("restarts_delta"),
                 "restarted_since_last": c.get("restarted_since_last"),
                 "started_at": c.get("started_at"),
-                "mem_mb": c.get("mem_mb"),
-                "swap_mb": c.get("swap_mb"),
+                "mem_mib": c.get("mem_mib"),
+                "swap_mib": c.get("swap_mib"),
             })
 
     # 内存占用前 N 名（无论是否异常都发），让 AI 能把内存/swap 问题落到具体容器
-    top_mem = sorted((c for c in conts if isinstance(c.get("mem_mb"), int)),
-                     key=lambda c: c["mem_mb"], reverse=True)[:TOP_MEM_N]
-    top_memory = [{k: c.get(k) for k in ("name", "mem_mb", "swap_mb", "mem_limit_mb")} for c in top_mem]
-    top_swap = sorted((c for c in conts if c.get("swap_mb")), key=lambda c: c["swap_mb"], reverse=True)[:TOP_MEM_N]
+    top_mem = sorted((c for c in conts if isinstance(c.get("mem_mib"), int)),
+                     key=lambda c: c["mem_mib"], reverse=True)[:TOP_MEM_N]
+    top_memory = [{k: c.get(k) for k in ("name", "mem_mib", "swap_mib", "budget_gib", "budget_pct")}
+                  for c in top_mem]
+    top_swap = sorted((c for c in conts if c.get("swap_mib")), key=lambda c: c["swap_mib"], reverse=True)[:TOP_MEM_N]
+    # slack_alert.sh 盯着的容器：用量相对其阈值的余量（无论是否在前 N 名都发）
+    budgets = [{k: c.get(k) for k in ("name", "mem_mib", "budget_gib", "budget_pct")}
+               for c in conts if c.get("budget_gib")]
 
     total = len(conts)
     running = sum(1 for c in conts if c["status"] == "running")
@@ -820,16 +927,21 @@ def build_ai_payload(snapshot):
                         "ignored": n_ignored},
             "notable": notable,   # 只发值得看的容器，正常的只给计数
             "top_memory": top_memory,
-            "top_swap": [{"name": c["name"], "swap_mb": c["swap_mb"]} for c in top_swap],
+            "top_swap": [{"name": c["name"], "swap_mib": c["swap_mib"]} for c in top_swap],
+            "slack_mem_budgets": budgets,
         },
         "web": snapshot["web"],
         "cloudwatch": snapshot.get("cloudwatch"),
+        "nginx": snapshot.get("nginx"),
         "flags": snapshot["alerts"],   # 确定性关注提示
         "rule_status": _overall(snapshot["alerts"]),
         "note_for_ai": ("flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数，IGNORE_CONTAINERS 中的容器已排除。"
                         "exit 0 退出的容器多为一次性任务。restarts 是累计值（长期累积属常态），restarts_delta 才是"
                         "上次巡检以来的新增重启。host.swap_io 是换页速率：swap 已用量高但换页速率≈0 表示历史残留，"
-                        "不等于当前内存压力。mem_mb/swap_mb 为各容器 cgroup 实测值（MB）。"
+                        "不等于当前内存压力。mem_mib/swap_mib 为各容器 cgroup 实测值（MiB），容量单位均为二进制（GiB/MiB）。"
+                        "slack_mem_budgets 是现有实时告警 slack_alert.sh 为部分容器设的内存阈值（GiB）及当前占比，"
+                        "≥95% 持续 15 分钟时 Slack 会实时报警。"
+                        "nginx 是反向代理访问日志的统计（窗口内请求数、5xx 数与比例、按状态码/路径分布）。"
                         "restarted_since_last=true 且 restarts_delta=0 表示非崩溃的重启（手动/重建/定时任务）。"
                         "host.disk_trend 是磁盘增速（GB/天，线性回归）及到达 WARN/CRIT 阈值的预计天数与日期。"
                         "cloudwatch 是 AWS 侧看到的本 EC2 实例指标（5 分钟粒度，latest 与近 1h/24h 的 avg/min/max，"
@@ -866,18 +978,47 @@ def _user_content(snapshot):
     return "健康チェックデータ(JSON):\n" + json.dumps(snapshot, ensure_ascii=False, indent=2)
 
 
+RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+def _post(url, payload, headers, timeout, retries=3, backoff=(5, 20)):
+    """POST JSON，返回响应文本。限流 / 5xx / 网络错误时退避重试，其余错误立即抛出。"""
+    data = json.dumps(payload).encode("utf-8")
+    for attempt in range(retries):
+        req = request.Request(url, data=data, headers={"content-type": "application/json", **headers}, method="POST")
+        try:
+            with request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8")
+        except error.HTTPError as e:
+            msg = f"HTTP {e.code} {e.reason}: {_short(e.read().decode('utf-8', 'replace'), 200)}"
+            if e.code not in RETRY_STATUS or attempt == retries - 1:
+                raise RuntimeError(msg) from None
+        except (error.URLError, TimeoutError, OSError) as e:
+            msg = f"网络错误：{e}"
+            if attempt == retries - 1:
+                raise RuntimeError(msg) from None
+        wait = backoff[min(attempt, len(backoff) - 1)]
+        print(f"[warn] {msg} → {wait}s 后重试（{attempt + 2}/{retries}）", file=sys.stderr)
+        time.sleep(wait)
+
+
 def _post_json(url, payload, headers, timeout):
-    req = request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                          headers={"content-type": "application/json", **headers}, method="POST")
-    try:
-        with request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")[:300]
-        raise RuntimeError(f"HTTP {e.code} {e.reason}: {body}") from None
+    return json.loads(_post(url, payload, headers, timeout))
 
 
 def _diagnose_gemini(snapshot):
+    models = [GEMINI_MODEL] + ([GEMINI_FALLBACK_MODEL] if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL else [])
+    for i, model in enumerate(models):
+        try:
+            text = _diagnose_gemini_model(snapshot, model)
+            return text + (f"\n\n（※ {GEMINI_MODEL} が失敗したため {model} で生成）" if i else "")
+        except RuntimeError as e:
+            if i == len(models) - 1:
+                raise
+            print(f"[warn] {model} 失败：{e} → 改用 {models[i + 1]}", file=sys.stderr)
+
+
+def _diagnose_gemini_model(snapshot, model):
     payload = {
         "systemInstruction": {"parts": [{"text": _system_prompt()}]},
         "contents": [{"role": "user", "parts": [{"text": _user_content(snapshot)}]}],
@@ -885,7 +1026,7 @@ def _diagnose_gemini(snapshot):
         "generationConfig": {"maxOutputTokens": 8192},
     }
     data = _post_json(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         payload, {"x-goog-api-key": GEMINI_API_KEY}, timeout=180,
     )
     cands = data.get("candidates", [])
@@ -953,14 +1094,14 @@ def render_markdown(snap, ai_text, generated_at):
     L.append("## ホストリソース")
     L.append("")
     d, m, s, lo = host.get("disk", {}), host.get("mem", {}), host.get("swap", {}), host.get("load", {})
-    L.append(f"- ディスク: {d.get('used_pct')}% 使用 ({d.get('used_gb')}/{d.get('total_gb')} GB)")
+    L.append(f"- ディスク: {d.get('used_pct')}% 使用 ({d.get('used_gib')}/{d.get('total_gib')} GiB、空き {d.get('avail_gib')} GiB)")
     tr = host.get("disk_trend")
     if tr:
         eta = "".join(f"、{pct}% まで約 {tr[f'days_to_{k}']} 日（{tr[f'eta_{k}']} 頃）"
                       for k, pct in (("warn", DISK_WARN), ("crit", DISK_CRIT)) if f"days_to_{k}" in tr)
-        L.append(f"- ディスク増加: {tr['gb_per_day']:+} GB/日（過去 {tr['span_days']} 日・{tr['points']} 点）{eta}")
-    L.append(f"- メモリ: {m.get('used_pct')}% 使用 (空き {m.get('available_gb')} GB / 全 {m.get('total_gb')} GB)")
-    L.append(f"- swap: {s.get('used_pct')}% 使用 ({s.get('used_gb')}/{s.get('total_gb')} GB)")
+        L.append(f"- ディスク増加: {tr['gib_per_day']:+} GiB/日（過去 {tr['span_days']} 日・{tr['points']} 点）{eta}")
+    L.append(f"- メモリ: {m.get('used_pct')}% 使用 (空き {m.get('available_gib')} GiB / 全 {m.get('total_gib')} GiB)")
+    L.append(f"- swap: {s.get('used_pct')}% 使用 ({s.get('used_gib')}/{s.get('total_gib')} GiB)")
     sio = host.get("swap_io", {})
     for key, label in (("now", f"直近 {sio.get('now_window_s')} 秒"), ("since_last", f"前回巡検から {sio.get('since_last_min')} 分")):
         if sio.get(key):
@@ -972,7 +1113,7 @@ def render_markdown(snap, ai_text, generated_at):
     L.append("")
     L.append("Restarts は累計（括弧内は前回巡検からの増分、— は比較データなし。🔄 = 前回巡検以降に手動/再作成等で再起動）。")
     L.append("")
-    L.append("| Container | Core | Status | Health | Uptime(d) | Restarts | Mem MB | Swap MB | OOM |")
+    L.append("| Container | Core | Status | Health | Uptime(d) | Restarts | Mem MiB | Swap MiB | OOM |")
     L.append("|-----------|------|--------|--------|-----------|----------|--------|---------|-----|")
 
     def _v(x):
@@ -982,9 +1123,10 @@ def render_markdown(snap, ai_text, generated_at):
         st = c["status"] + (f" ({c.get('exit_code')})" if c["status"] == "exited" else "")
         mark = "(ignored)" if c.get("ignored") else ("★" if c["watched"] else "")
         rd = c.get("restarts_delta")
+        budget = f" ({c['budget_pct']}% of {c['budget_gib']}G)" if c.get("budget_gib") else ""
         rs = f"{c['restarts']} ({'+' + str(rd) if rd else _v(rd)})" + (" 🔄" if c.get("restarted_since_last") else "")
         L.append(f"| {c['name']} | {mark} | {st} | {c['health']} | {_v(c.get('uptime_days'))} | {rs} | "
-                 f"{_v(c.get('mem_mb'))} | {_v(c.get('swap_mb'))} | {'⚠️' if c['oom_killed'] else ''} |")
+                 f"{_v(c.get('mem_mib'))}{budget} | {_v(c.get('swap_mib'))} | {'⚠️' if c['oom_killed'] else ''} |")
     L.append("")
     # 网页
     if web:
@@ -994,6 +1136,19 @@ def render_markdown(snap, ai_text, generated_at):
         L.append("|--------|--------|----|---------|")
         for w in web:
             L.append(f"| {w['name']} | {w.get('status')} | {'✅' if w.get('ok') else '❌'} | {w.get('latency_ms')}ms |")
+        L.append("")
+    ng = snap.get("nginx") or []
+    if ng:
+        L.append("## nginx アクセスログ")
+        L.append("")
+        for n in ng:
+            if n.get("error"):
+                L.append(f"- {n['container']}: 取得失敗 {n['error']}")
+                continue
+            L.append(f"- {n['container']}（直近 {n['window_h']}h）: リクエスト {n['requests']} 件、5xx {n['5xx']} 件"
+                     f"（{n['5xx_pct']}%）{' ※途中打ち切り' if n.get('truncated') else ''}")
+            for path, cnt in n.get("top_paths", []):
+                L.append(f"  - {path}: {cnt} 件")
         L.append("")
     cw = snap.get("cloudwatch")
     if cw is not None:
@@ -1043,6 +1198,77 @@ def cleanup_old(out_dir, keep_days):
 
 
 # ----------------------------------------------------------------------------
+# Slack 通知：只在状态变化时发。比较对象是上次「已成功通知」的状态（存 state.json），
+# 发送失败则不更新，下次运行会再尝试。INFO 不参与。
+# ----------------------------------------------------------------------------
+_COLOR = {"危険": "danger", "注意": "warning", "正常": "good"}
+_EMOJI = {"危険": ":red_circle:", "注意": ":large_yellow_circle:", "正常": ":white_check_mark:"}
+
+
+def _alert_key(a):
+    # 去掉数字：同一问题只是数值变了（swap 5.7→5.8GiB）不算变化
+    return re.sub(r"\d+(?:\.\d+)?", "#", a)
+
+
+def _send_slack(title, text, color, footer):
+    payload = {"attachments": [{"color": color, "title": title, "text": text[:3500],
+                                "footer": footer, "mrkdwn_in": ["text"]}]}
+    _post(SLACK_WEBHOOK_URL, payload, {}, timeout=15, backoff=(3, 10))
+
+
+def notify_on_change(alerts, prev_notify, ai_text, generated_at):
+    """返回应写回 state 的 notify 状态。"""
+    overall = _overall(alerts)
+    cur = {_alert_key(a): a for a in alerts if a.startswith(("[WARN]", "[CRIT]"))}
+    prev_keys = prev_notify.get("keys", {})
+    prev_status = prev_notify.get("status", "正常")
+    new = [cur[k] for k in cur if k not in prev_keys]
+    resolved = [prev_keys[k] for k in prev_keys if k not in cur]
+    new_state = {"status": overall, "keys": cur}
+    if overall == prev_status and not new and not resolved:
+        print("[ok] 状态无变化，不发 Slack")
+        return new_state
+    if not SLACK_WEBHOOK_URL:
+        print("[warn] 状态有变化，但未设置 SLACK_WEBHOOK_URL，跳过通知", file=sys.stderr)
+        return prev_notify     # 不记为已通知：配置后首次运行会补发
+    host = socket.gethostname()
+    title = (f"{_EMOJI[overall]} プラットフォーム巡検: {prev_status} → {overall}" if overall != prev_status
+             else f"{_EMOJI[overall]} プラットフォーム巡検: {overall}（内容に変化あり）")
+    parts = []
+    if new:
+        parts.append("*新規*\n" + "\n".join(f"• {a}" for a in new))
+    if resolved:
+        parts.append("*解消*\n" + "\n".join(f"• {a}" for a in resolved))
+    if ai_text:
+        summary = "\n".join(ai_text.strip().splitlines()[:15])
+        parts.append("*AI 診断（抜粋）*\n" + _short_lines(summary, 1500))
+    try:
+        _send_slack(title, "\n\n".join(parts), _COLOR[overall],
+                    f"{host} | {generated_at} | 詳細: {os.path.join(OUT_DIR, 'health_latest.md')}")
+        print("[ok] 已发送 Slack 通知")
+        return new_state
+    except RuntimeError as e:
+        print(f"[warn] Slack 通知失败（下次运行重试）：{e}", file=sys.stderr)
+        return prev_notify
+
+
+def _short_lines(text, n):
+    return text if len(text) <= n else text[:n] + "…"
+
+
+def _acquire_lock():
+    """防止两次巡检重叠（例如上一次卡在 docker / AI 上）。拿不到锁就直接退出。"""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    fh = open(os.path.join(OUT_DIR, ".lock"), "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[warn] 另一次巡检仍在运行，本次跳过", file=sys.stderr)
+        sys.exit(0)
+    return fh
+
+
+# ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
 def main():
@@ -1051,7 +1277,18 @@ def main():
     ap.add_argument("--stdout", action="store_true", help="报告同时打印到终端")
     ap.add_argument("--show-payload", action="store_true",
                     help="把「原封不动准备发送给 AI 的 JSON」打印到终端（不调 AI）")
+    ap.add_argument("--no-notify", action="store_true", help="不发 Slack 通知（--dry-run 时也不发）")
+    ap.add_argument("--notify-test", action="store_true", help="向 SLACK_WEBHOOK_URL 发一条测试消息后退出")
     args = ap.parse_args()
+
+    if args.notify_test:
+        if not SLACK_WEBHOOK_URL:
+            sys.exit("未设置 SLACK_WEBHOOK_URL")
+        _send_slack(":test_tube: プラットフォーム巡検: 通知テスト", "platform_health.py からのテスト送信です。",
+                    "#439FE0", socket.gethostname())
+        print("[ok] 测试消息已发送")
+        return
+    _lock = _acquire_lock()  # noqa: F841  进程结束自动释放
 
     now = dt.datetime.now(dt.timezone.utc)
     generated_at = now.strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1064,7 +1301,10 @@ def main():
     cinfo, containers = collect_containers()
     collect_container_mem(containers)
     apply_restart_delta(containers, prev)
+    apply_mem_budgets(containers)
     web = collect_web()
+    nginx_window = min(time.time() - prev["ts"], NGINX_MAX_WINDOW_H * 3600) if prev.get("ts") else NGINX_MAX_WINDOW_H * 3600
+    nginx = collect_nginx(nginx_window) if not cinfo.get("error") else []
 
     # swap 换页速率：本次运行期间（至少 3 秒窗口）+ 上次巡检以来的平均
     elapsed = time.time() - t0
@@ -1078,7 +1318,7 @@ def main():
     if cinfo.get("error"):
         print(f"[warn] 容器采集失败: {cinfo['error']}", file=sys.stderr)
     cw = collect_cloudwatch()
-    alerts = compute_alerts(host, containers, web, cw)
+    alerts = compute_alerts(host, containers, web, cw, nginx)
     if cinfo.get("error"):
         # 采集不到≠没问题：不能让总合状态显示为 🟢
         alerts.insert(0, f"[WARN] 容器状态采集失败，本次结果不完整：{cinfo['error']}")
@@ -1092,6 +1332,7 @@ def main():
         "container_collect_error": cinfo.get("error"),
         "web": web,
         "cloudwatch": cw,
+        "nginx": nginx,
         "alerts": alerts,
     }
 
@@ -1123,7 +1364,10 @@ def main():
     stamp = now.strftime("%Y%m%d_%H%M%S")
     with open(os.path.join(OUT_DIR, f"health_{stamp}.json"), "w", encoding="utf-8") as f:
         json.dump(snapshot, f, ensure_ascii=False, indent=2)
-    save_state(prev, containers, not cinfo.get("error"), vm1, t1, disk_hist)
+    notify = prev.get("notify", {})
+    if not (args.dry_run or args.no_notify):
+        notify = notify_on_change(alerts, notify, ai_text, generated_at)
+    save_state(prev, containers, not cinfo.get("error"), vm1, t1, disk_hist, notify)
     with open(os.path.join(OUT_DIR, f"health_{stamp}.md"), "w", encoding="utf-8") as f:
         f.write(md)
     with open(os.path.join(OUT_DIR, "health_latest.md"), "w", encoding="utf-8") as f:

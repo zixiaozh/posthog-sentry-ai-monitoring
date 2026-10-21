@@ -25,9 +25,11 @@
 
 | 项目 | 字段 | 来源 |
 |------|------|------|
-| 磁盘（根分区 `/`） | `total_gb` / `used_gb` / `used_pct` | statvfs |
-| 内存 | `total_gb` / `available_gb` / `used_pct` | /proc/meminfo |
-| swap | `total_gb` / `used_gb` / `used_pct` | /proc/meminfo |
+| 磁盘（根分区 `/`） | `total_gib` / `used_gib` / `avail_gib` / `used_pct` | statvfs（Use% 口径同 `df`：保留块不计入，向上取整） |
+| 内存 | `total_gib` / `available_gib` / `used_pct` | /proc/meminfo |
+| swap | `total_gib` / `used_gib` / `used_pct` | /proc/meminfo |
+
+> 容量**统一用二进制单位（GiB / MiB）**，与 `slack_alert.sh`（÷1048576）、`docker stats`、`df -h` 一致，阈值才真正可比。
 | 负载 | `1m` / `5m` / `15m` / `cpu_count` / `per_cpu_1m` | os.getloadavg |
 
 ### 2.2 容器健康（来源：`docker inspect`，需 root/docker 组）
@@ -46,12 +48,14 @@
 | `exit_code` | 退出码（区分正常结束与崩溃） |
 | `restarts_delta` | **上次巡检以来新增的重启次数**（与 `out/state.json` 比较；首次运行或容器被重建时为空） |
 | `restarted_since_last` | 启动时间与上次不同。RestartCount 只统计 restart policy 的自动重启，`docker restart` / compose 重建 / 定时任务重启只能靠它发现 |
-| `mem_mb` / `swap_mb` / `mem_limit_mb` | 容器内存 / swap 实际占用与上限（cgroup v2 直读，口径同 `docker stats`；读不到时退回 `docker stats`，仅内存） |
+| `mem_mib` / `swap_mib` / `mem_limit_mib` | 容器内存 / swap 实际占用与上限（cgroup v2 直读，口径同 `docker stats`；读不到时退回 `docker stats`，仅内存） |
+| `budget_gib` / `budget_pct` | `slack_alert.sh` 为该容器设的内存阈值（`CONTAINER_MEM_BUDGETS`）及当前占比 |
 
 ### 2.1b 磁盘增速预测（`host.disk_trend`）
 
-每次把磁盘已用量存入 `out/state.json`（保留最近 `DISK_TREND_DAYS` 天，首次从 `out/health_*.json` 历史快照补种），
-用最小二乘求 **GB/天**，并预测到达 `DISK_WARN` / `DISK_CRIT` 的天数和日期。样本跨度不足 12 小时不计算。
+每次把**可用空间**存入 `out/state.json`（保留最近 `DISK_TREND_DAYS` 天，首次从 `out/health_*.json` 历史快照补种，兼容旧的十进制 GB 格式），
+用最小二乘求 **GiB/天**，并按 df 口径预测 Use% 到达 `DISK_WARN` / `DISK_CRIT` 的天数和日期。样本跨度不足 12 小时不计算。
+记录可用空间而非已用量，是为了不受口径 / 单位变化影响。
 
 ### 2.2b swap 换页活动（来源：`/proc/vmstat` 的 `pswpin` / `pswpout`）
 
@@ -75,6 +79,14 @@
 已确认端点（深度健康检查，会验依赖，均返回 200）：
 - Sentry：`https://sentry.randd-nn-freebit.net/_health/`
 - PostHog：`https://posthog.randd-nn-freebit.net/_health`（EC2 本机实测约 150ms，2026-10）
+
+### 2.3b nginx 访问日志（来源：`docker logs`）
+
+统计 `NGINX_CONTAINERS`（默认 `sentry-self-hosted-nginx-1`）在**上次巡检以来**（最长 `NGINX_MAX_WINDOW_H`=24h）的
+请求数、5xx 数与比例、按状态码分布、5xx 最多的路径前 5。流式计数，内存有界，最长 60 秒。
+路径**去掉 query**（Sentry 上报 URL 含 `sentry_key`），数字段归一为 `{n}`。
+
+> 与 `slack_alert_http.sh` 的区别：后者每 5 分钟只要有 1 件 5xx 就实时通知；本脚本看一天的**比例和分布**，交给 AI 判断是否异常。
 
 ### 2.4 CloudWatch（来源：`aws cloudwatch get-metric-data` / `describe-alarms`）
 
@@ -108,8 +120,12 @@
 | 指标 | WARN | CRIT | 对应 Slack 变量 |
 |------|------|------|----------------|
 | 磁盘使用率 | ≥ 85% | ≥ 95% | DISK_WARN_PCT / DISK_CRIT_PCT |
-| 可用内存 | ≤ 2 GB | ≤ 1 GB | RAM_WARN_GB / RAM_CRIT_GB |
-| swap 已用 | ≥ 5 GB | ≥ 10 GB | SWAP_WARN_GB / SWAP_CRIT_GB（换页闲置时降一级，见下） |
+| 可用内存 | < 2 GiB | < 1 GiB | RAM_WARN_GB / RAM_CRIT_GB |
+| swap 已用 | ≥ 8 GiB | ≥ 10 GiB | SWAP_WARN_GB / SWAP_CRIT_GB（换页闲置时降一级，见下） |
+
+> 2026-10-21 核对 `slack_alert.sh` 实物后修正：swap WARN 原误写为 5，单位原为十进制 GB。
+>
+> 其他：容器内存达 Slack 阈值的 `BUDGET_INFO_PCT`(默认 80%) → INFO；nginx 5xx ≥ `NGINX_5XX_WARN_MIN`(20) 件且 ≥ `NGINX_5XX_WARN_PCT`(1%) → WARN，否则有 5xx 仅 INFO。
 | 每核 load(1m) | ≥ 1.5 | — | （本脚本独有） |
 | swap 换页（上次巡检以来平均） | ≥ 1024 KB/s | — | （本脚本独有，`SWAP_IO_WARN_KBPS`） |
 
@@ -229,16 +245,17 @@
 
 ---
 
-## 6. 与 slack_alert.sh 的分工
+## 6. 与 slack_alert.sh / slack_alert_http.sh 的分工
 
-| | slack_alert.sh | platform_health.py（本脚本） |
+| | slack_alert.sh + slack_alert_http.sh | platform_health.py（本脚本） |
 |---|---|---|
-| 角色 | **实时告警** | **定期综合巡检 + AI 诊断** |
-| 触发 | 指标破线即时 ping | cron 定期运行 |
-| 覆盖 | 主机 RAM/Disk/Swap 阈值、容器内存 vs 限额 | 容器 status/health/OOM/重启/uptime、网页可用性、跨项画像 |
-| 阈值 | **唯一真源** | 对齐 Slack，仅用于给 AI 提示 |
+| 角色 | **实时检测**（每 5 分钟） | **每日诊断 + 预测**（每天 1 次） |
+| 覆盖 | RAM / Disk / Swap 阈值、4 个容器内存 vs 阈值、nginx 5xx | 容器状态/重启增量/非崩溃重启、Web 探活、CloudWatch、nginx 5xx 比例、磁盘增速预测、AI 原因分析 |
+| 阈值 | **唯一真源** | 对齐 Slack（swap 8/10 GiB、RAM 2/1 GiB、Disk 85/95%、容器内存阈值） |
+| 通知 | 破线即发（同一告警 24h 一次） | **只在状态变化时**发到同一频道（新规 / 解消 / 总合状态变化 + AI 摘要） |
 
-两者互补：Slack 负责「现在破线了叫我」，本脚本负责「整体健康画像 + 原因分析 + 建议」。
+注意：本脚本每天只跑一次，**不适合承担「服务挂了」的实时检测**（最多晚 24 小时）。
+容器停止、Web 完全不通、AWS 状态检查失败等，若需实时告警，应补到 Slack bot 或 CloudWatch 告警里。
 
 ---
 
@@ -249,8 +266,33 @@ cd posthog-sentry-ai-monitoring
 cp .env.example .env             # ★ 脚本读的是 .env，不是 .env.example
 sudo python3 platform_health.py --show-payload   # 只看 payload，不调 AI
 sudo python3 platform_health.py --dry-run --stdout  # 看渲染报告，写 out/
-sudo python3 platform_health.py                  # 完整：含 AI 诊断（需 API key）
+sudo python3 platform_health.py                  # 完整：含 AI 诊断 + 状态变化时 Slack 通知
+sudo python3 platform_health.py --no-notify      # 完整，但不发 Slack
+sudo python3 platform_health.py --notify-test    # 只向 SLACK_WEBHOOK_URL 发一条测试消息
 ```
+
+### 7.1 Slack 通知
+
+- `.env` 设 `SLACK_WEBHOOK_URL`（与 `slack_alert.sh` 同一 Webhook / 频道即可）。**不要写进代码或提交到 git。**
+- 只在 WARN/CRIT 集合或总合状态**发生变化**时发送（INFO 不参与；仅数值变化如 swap 5.7→5.8 不算变化）。
+- 比较对象是上次**成功通知**的状态（`state.json` 的 `notify`）；发送失败不更新，下次运行自动补发。
+- `--dry-run` / `--no-notify` 时不发送。
+
+### 7.2 出错恢复
+
+- AI / Slack 调用遇 429 / 5xx / 网络错误自动退避重试（最多 3 次）。
+- `gemini-2.5-pro` 重试后仍失败 → 改用 `GEMINI_FALLBACK_MODEL`（默认 `gemini-2.5-flash`），报告中注明。AI 全部失败 → 仅出规则报告。
+- `out/.lock` 防止两次巡检重叠；部分数据源失败（docker / CloudWatch / nginx 日志）只记 INFO 或 WARN，其余照常。
+
+### 7.3 定时运行（每天 1 次）
+
+root 的 crontab（`sudo crontab -e`），用 `systemd-run` 限制**本脚本自身**的资源，不影响容器：
+
+```
+0 0 * * * cd /path/to/posthog-sentry-ai-monitoring && systemd-run --scope --quiet -p MemoryMax=256M -p CPUQuota=50\% nice -n 10 ionice -c3 python3 platform_health.py >> out/cron.log 2>&1
+```
+
+（UTC 0 时 = JST 9 时。若机器上没有 crond，可改用 systemd timer。）
 
 - 脚本**自动加载同目录 `.env`**（因此 `sudo` 清空环境变量也不影响）；已存在的环境变量优先，`.env` 中的空值视为未设置。
 - 读容器信息需权限，故用 `sudo`。
@@ -265,8 +307,8 @@ sudo python3 platform_health.py                  # 完整：含 AI 诊断（需 
 | WATCH_PREFIXES | -web-,-nginx-,-relay-,-postgres-,-db-,-pgbouncer-,-kafka-,-clickhouse-,-redis,-snuba-api-,-taskworker-,-capture-,-ingestion- | 核心容器（名称包含即匹配） |
 | IGNORE_CONTAINERS | 空 | 完全排除判定的容器（名称包含即匹配） |
 | DISK_WARN / DISK_CRIT | 85 / 95 | 磁盘阈值 % |
-| MEM_AVAIL_WARN_GB / _CRIT_GB | 2 / 1 | 可用内存阈值 GB |
-| SWAP_WARN_GB / _CRIT_GB | 5 / 10 | swap 已用阈值 GB |
+| MEM_AVAIL_WARN_GB / _CRIT_GB | 2 / 1 | 可用内存阈值 GiB（< 判定，同 Slack） |
+| SWAP_WARN_GB / _CRIT_GB | 8 / 10 | swap 已用阈值 GiB（同 Slack） |
 | LOAD_PER_CPU_WARN | 1.5 | 每核 load |
 | RECENT_RESTART_DAYS | 1 | 无增量数据时「最近重启」判定天数 |
 | RESTART_DELTA_CRIT | 3 | 上次巡检以来新增重启 ≥N → CRIT（≥1 → WARN） |
@@ -279,6 +321,13 @@ sudo python3 platform_health.py                  # 完整：含 AI 诊断（需 
 | CW_CPU_WARN | 80 | 近 1h CPU 平均 % 阈值 |
 | CW_BALANCE_WARN | 20 | EBS 突发余额 % 阈值 |
 | CW_CPU_CREDIT_WARN | 10 | T 系 CPU credit 余额阈值 |
+| CONTAINER_MEM_BUDGETS | 同 slack_alert.sh 的 CONTAINERS | 容器内存阈值 `名称:GiB,...` |
+| BUDGET_INFO_PCT | 80 | 达阈值 N% → INFO |
+| NGINX_CONTAINERS | sentry-self-hosted-nginx-1 | 统计 5xx 的 nginx 容器 |
+| NGINX_MAX_WINDOW_H | 24 | 统计窗口上限（小时） |
+| NGINX_5XX_WARN_PCT / _MIN | 1 / 20 | 5xx 比例 % 且件数 → WARN |
+| SLACK_WEBHOOK_URL | 空 | 状态变化通知；空 = 不发 |
+| GEMINI_FALLBACK_MODEL | gemini-2.5-flash | 主模型失败时的降级模型 |
 | AI_PROVIDER | gemini | AI 诊断用哪家：gemini / anthropic |
 | GEMINI_API_KEY / MODEL | 空 / gemini-2.5-pro | Gemini（AI Studio 发行） |
 | ANTHROPIC_API_KEY / MODEL | 空 / claude-sonnet-5-5 | Claude（Anthropic Console 发行，单独计费） |
@@ -298,4 +347,4 @@ sudo python3 platform_health.py                  # 完整：含 AI 诊断（需 
 - **层次 2**：用 Sentry 只读 token 查「最新事件时间」，检测摄取停滞（覆盖「issues 没显示」）。
 - **层次 3**：Kafka consumer lag / 队列深度 / worker 日志，查根因（如 export 失败）。
 - ~~接入 CloudWatch~~（已实现指标 + 告警，见 2.4；待实例角色授权后生效）。下一步：Cost Explorer。
-- 上 cron + `systemd-run` 资源护栏定期运行。
+- 部署每日定时运行（见 7.3）。
