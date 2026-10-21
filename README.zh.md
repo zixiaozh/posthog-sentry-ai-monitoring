@@ -45,7 +45,13 @@
 | `watched` | 名称是否包含 `WATCH_PREFIXES` 中的任一项，即是否平台核心容器（★） |
 | `exit_code` | 退出码（区分正常结束与崩溃） |
 | `restarts_delta` | **上次巡检以来新增的重启次数**（与 `out/state.json` 比较；首次运行或容器被重建时为空） |
+| `restarted_since_last` | 启动时间与上次不同。RestartCount 只统计 restart policy 的自动重启，`docker restart` / compose 重建 / 定时任务重启只能靠它发现 |
 | `mem_mb` / `swap_mb` / `mem_limit_mb` | 容器内存 / swap 实际占用与上限（cgroup v2 直读，口径同 `docker stats`；读不到时退回 `docker stats`，仅内存） |
+
+### 2.1b 磁盘增速预测（`host.disk_trend`）
+
+每次把磁盘已用量存入 `out/state.json`（保留最近 `DISK_TREND_DAYS` 天，首次从 `out/health_*.json` 历史快照补种），
+用最小二乘求 **GB/天**，并预测到达 `DISK_WARN` / `DISK_CRIT` 的天数和日期。样本跨度不足 12 小时不计算。
 
 ### 2.2b swap 换页活动（来源：`/proc/vmstat` 的 `pswpin` / `pswpout`）
 
@@ -103,11 +109,14 @@
 |------|------|------|----------------|
 | 磁盘使用率 | ≥ 85% | ≥ 95% | DISK_WARN_PCT / DISK_CRIT_PCT |
 | 可用内存 | ≤ 2 GB | ≤ 1 GB | RAM_WARN_GB / RAM_CRIT_GB |
-| swap 已用 | ≥ 5 GB | ≥ 10 GB | SWAP_WARN_GB / SWAP_CRIT_GB |
+| swap 已用 | ≥ 5 GB | ≥ 10 GB | SWAP_WARN_GB / SWAP_CRIT_GB（换页闲置时降一级，见下） |
 | 每核 load(1m) | ≥ 1.5 | — | （本脚本独有） |
 | swap 换页（上次巡检以来平均） | ≥ 1024 KB/s | — | （本脚本独有，`SWAP_IO_WARN_KBPS`） |
 
-> swap 已用量的告警文字会附上换页速率，注明是「仍在活跃换页」还是「历史残留」。
+> swap 已用量的告警文字会附上换页速率（优先用上次巡检以来的长窗口）。**换页 < `SWAP_IO_WARN_KBPS`/10 时视为闲置残留，降一级**（WARN→INFO、CRIT→WARN），
+> 避免长期残留的 swap 每次都报成噪音；真正的内存压力由「持续换页」规则负责。Slack 的绝对阈值告警不受影响。
+>
+> 磁盘：预计 `DISK_FORECAST_WARN_DAYS`(默认 30) 天内到达 `DISK_WARN` → WARN。
 
 ### 3.2 容器判定
 
@@ -121,6 +130,7 @@
 | running 但 `health` ∈ {unhealthy, starting…}（非 healthy/none） | WARN |
 | 上次巡检以来新增重启 ≥ `RESTART_DELTA_CRIT`(默认 3) | CRIT（疑似反复崩溃） |
 | 上次巡检以来新增重启 1 ～ N-1 次 | WARN |
+| 启动时间变了但 RestartCount 未增加（手动 restart / 重建 / 定时任务） | INFO |
 | 无增量数据（首次运行/容器重建）且 `uptime_days` < `RECENT_RESTART_DAYS`(默认 1) | INFO |
 | 名称匹配 `IGNORE_CONTAINERS` | 不判定、不发给 AI |
 | docker 本身采集失败（权限等） | WARN（避免误显示 🟢） |
@@ -199,6 +209,8 @@
 
 ### 4.4 AI 诊断（可选）
 
+提示词另要求：总合状态以 `rule_status` 为准；重启等有影响的操作须有具体根据（不得仅因 swap 已用量建议重启）；有 `disk_trend` 时说明容量到达时期与对策。
+
 按 `AI_PROVIDER` 选择模型（默认 `gemini`，需 `GEMINI_API_KEY`；`anthropic` 需 `ANTHROPIC_API_KEY`），把上面 payload 交给 AI，要求用 `REPORT_LANG`（默认 ja）输出：
 ① 总合状态一行 ② 检测到的异常与影响 ③ 想定原因 ④ 推奨アクション。对应 key 未设则跳过，仅出规则 flags。报告中的「AI 診断」标题会注明所用 provider / 模型。
 
@@ -260,6 +272,8 @@ sudo python3 platform_health.py                  # 完整：含 AI 诊断（需 
 | RESTART_DELTA_CRIT | 3 | 上次巡检以来新增重启 ≥N → CRIT（≥1 → WARN） |
 | SWAP_IO_WARN_KBPS | 1024 | 上次巡检以来 swap 换页平均 KB/s 阈值 |
 | TOP_MEM_N | 8 | 发给 AI 的内存 / swap 前 N 名容器 |
+| DISK_TREND_DAYS | 14 | 磁盘增速回归窗口（天） |
+| DISK_FORECAST_WARN_DAYS | 30 | 预计 N 天内到达 DISK_WARN → WARN |
 | CLOUDWATCH | 1 | 0 = 不查 CloudWatch |
 | CW_INSTANCE_ID / AWS_REGION | 空（IMDS 自动取） | 覆盖实例 ID / region |
 | CW_CPU_WARN | 80 | 近 1h CPU 平均 % 阈值 |

@@ -92,6 +92,8 @@ WEB_LATENCY_WARN_MS = int(os.environ.get("WEB_LATENCY_WARN_MS", "5000"))  # 网�
 SWAP_IO_WARN_KBPS = float(os.environ.get("SWAP_IO_WARN_KBPS", "1024"))  # 上次巡检以来 swap 换入+换出平均 KB/s
 RESTART_DELTA_CRIT = int(os.environ.get("RESTART_DELTA_CRIT", "3"))  # 上次巡检以来新增重启 ≥N → CRIT（≥1 → WARN）
 TOP_MEM_N = int(os.environ.get("TOP_MEM_N", "8"))                     # 发给 AI 的内存占用前 N 名容器
+DISK_TREND_DAYS = float(os.environ.get("DISK_TREND_DAYS", "14"))      # 磁盘增速按最近 N 天的样本线性回归
+DISK_FORECAST_WARN_DAYS = float(os.environ.get("DISK_FORECAST_WARN_DAYS", "30"))  # 预计 N 天内到达 DISK_WARN → WARN
 
 # AI
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").strip().lower()   # gemini | anthropic
@@ -378,8 +380,8 @@ def load_state():
         return {}
 
 
-def save_state(prev, containers, collect_ok, vmstat, ts):
-    state = {"ts": ts, "vmstat": vmstat,
+def save_state(prev, containers, collect_ok, vmstat, ts, disk_history):
+    state = {"ts": ts, "vmstat": vmstat, "disk_history": disk_history,
              # 容器采集失败时沿用上次的容器计数，避免下次算出错误增量
              "containers": ({c["name"]: {"restarts": c["restarts"], "started_at": c["started_at"]}
                              for c in containers} if collect_ok else prev.get("containers", {}))}
@@ -391,7 +393,9 @@ def save_state(prev, containers, collect_ok, vmstat, ts):
 
 
 def apply_restart_delta(containers, prev):
-    """restarts_delta = 上次巡检以来新增的重启次数。无上次记录 / 容器被重建（计数归零）时为 None。"""
+    """restarts_delta = 上次巡检以来新增的重启次数。无上次记录 / 容器被重建（计数归零）时为 None。
+    restarted_since_last = 启动时间变了。RestartCount 只统计 restart policy 触发的重启，
+    `docker restart`、compose 重建、定时任务重启都不会让它增加，只能靠启动时间发现。"""
     pc = prev.get("containers", {})
     for c in containers:
         p = pc.get(c["name"])
@@ -400,6 +404,58 @@ def apply_restart_delta(containers, prev):
             c["restarts_delta"] = d if d >= 0 else None
         else:
             c["restarts_delta"] = None
+        c["restarted_since_last"] = bool(p and p.get("started_at") and c["status"] == "running"
+                                         and p["started_at"] != c["started_at"])
+
+
+# ----------------------------------------------------------------------------
+# 1e) 磁盘增速与到达阈值的预测（样本存 state.json；首次时从 out/ 里的历史快照补种）
+# ----------------------------------------------------------------------------
+def _seed_disk_history():
+    hist = []
+    try:
+        names = sorted(n for n in os.listdir(OUT_DIR) if n.startswith("health_2") and n.endswith(".json"))
+    except OSError:
+        return hist
+    for n in names:
+        try:
+            ts = dt.datetime.strptime(n[7:22], "%Y%m%d_%H%M%S").replace(tzinfo=dt.timezone.utc).timestamp()
+            with open(os.path.join(OUT_DIR, n), encoding="utf-8") as f:
+                used = json.load(f)["host"]["disk"]["used_gb"]
+            hist.append([ts, used])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return hist
+
+
+def update_disk_history(prev, disk, ts):
+    hist = prev.get("disk_history") or _seed_disk_history()
+    if isinstance(disk.get("used_gb"), (int, float)):
+        hist.append([ts, disk["used_gb"]])
+    cutoff = ts - DISK_TREND_DAYS * 86400
+    return [h for h in hist if h[0] >= cutoff]
+
+
+def disk_trend(hist, disk):
+    """最小二乘求 GB/天，并预测到达 DISK_WARN / DISK_CRIT 的天数。样本跨度不足 12 小时则不算。"""
+    total = disk.get("total_gb")
+    if len(hist) < 2 or not total or hist[-1][0] - hist[0][0] < 12 * 3600:
+        return None
+    xs = [(t - hist[0][0]) / 86400 for t, _ in hist]
+    ys = [u for _, u in hist]
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    var = sum((x - mx) ** 2 for x in xs)
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var
+    out = {"gb_per_day": round(slope, 2), "span_days": round(xs[-1], 1), "points": len(hist)}
+    now_used = ys[-1]
+    for key, pct in (("warn", DISK_WARN), ("crit", DISK_CRIT)):
+        remain = total * pct / 100 - now_used
+        if slope > 0.01 and remain > 0:
+            days = remain / slope
+            out[f"days_to_{key}"] = round(days)
+            out[f"eta_{key}"] = (dt.datetime.fromtimestamp(hist[-1][0], dt.timezone.utc)
+                                 + dt.timedelta(days=days)).strftime("%Y-%m-%d")
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -599,6 +655,10 @@ def compute_alerts(host, containers, web, cw=None):
             alerts.append(f"[CRIT] 磁盘使用率 {d['used_pct']}% ≥ {DISK_CRIT}%")
         elif d["used_pct"] >= DISK_WARN:
             alerts.append(f"[WARN] 磁盘使用率 {d['used_pct']}% ≥ {DISK_WARN}%")
+    tr = host.get("disk_trend") or {}
+    if "days_to_warn" in tr and tr["days_to_warn"] <= DISK_FORECAST_WARN_DAYS:
+        alerts.append(f"[WARN] 磁盘按 +{tr['gb_per_day']}GB/天 增长，约 {tr['days_to_warn']} 天后（{tr['eta_warn']} 前后）"
+                      f"达到 {DISK_WARN}%")
 
     m = host.get("mem", {})
     av = m.get("available_gb")
@@ -611,18 +671,22 @@ def compute_alerts(host, containers, web, cw=None):
     s = host.get("swap", {})
     sio = host.get("swap_io", {})
     # 用换页速率给「swap 已用量」加注：已用多但几乎不换页 → 多为历史残留
+    # 优先用「上次巡检以来」的长窗口；3 秒的瞬时值易被本次巡检自身触发的换入干扰
     rate = sio.get("since_last") or sio.get("now")
-    hint = ""
+    hint, idle = "", False
     if rate:
-        tot = rate["in_kbps"] + rate["out_kbps"]
-        hint = (f"（换页 {tot}KB/s，几乎无活动，多为历史换出的残留）" if tot < SWAP_IO_WARN_KBPS / 10
+        tot = round(rate["in_kbps"] + rate["out_kbps"], 1)
+        idle = tot < SWAP_IO_WARN_KBPS / 10
+        hint = (f"（换页 {tot}KB/s，几乎无活动，多为历史换出的残留，已降级）" if idle
                 else f"（换页 {tot}KB/s，仍在活跃换页）")
     su = s.get("used_gb")
     if isinstance(su, (int, float)):
+        # 闲置的 swap 不影响性能：降一级（WARN→INFO、CRIT→WARN），避免每次都报成噪音。
+        # Slack 的绝对阈值告警不受影响；真正的内存压力由下面的「持续换页」规则负责。
         if su >= SWAP_CRIT_GB:
-            alerts.append(f"[CRIT] swap 已用 {su}GB ≥ {SWAP_CRIT_GB}GB{hint}")
+            alerts.append(f"[{'WARN' if idle else 'CRIT'}] swap 已用 {su}GB ≥ {SWAP_CRIT_GB}GB{hint}")
         elif su >= SWAP_WARN_GB:
-            alerts.append(f"[WARN] swap 已用 {su}GB ≥ {SWAP_WARN_GB}GB{hint}")
+            alerts.append(f"[{'INFO' if idle else 'WARN'}] swap 已用 {su}GB ≥ {SWAP_WARN_GB}GB{hint}")
     sl = sio.get("since_last")
     if sl and sl["in_kbps"] + sl["out_kbps"] >= SWAP_IO_WARN_KBPS:
         alerts.append(f"[WARN] 上次巡检以来 swap 持续换页：换入 {sl['in_kbps']}KB/s / 换出 {sl['out_kbps']}KB/s"
@@ -662,6 +726,10 @@ def compute_alerts(host, containers, web, cw=None):
             lv = "CRIT" if rd >= RESTART_DELTA_CRIT else "WARN"
             why = "，疑似反复崩溃" if lv == "CRIT" else ""
             alerts.append(f"[{lv}] {tag} {c['name']} 上次巡检以来重启 {rd} 次（累计 {c['restarts']}{why}）")
+            continue
+        if c.get("restarted_since_last"):
+            alerts.append(f"[INFO] {tag} {c['name']} 上次巡检以来被重新启动（RestartCount 未增加 → 非崩溃自愈，"
+                          f"而是手动 restart / compose 重建 / 定时任务；启动于 {c['started_at'][:16]}Z）")
             continue
         # 无增量数据（首次运行等）时，退而标「最近重启过」
         ud = c.get("uptime_days")
@@ -713,7 +781,8 @@ def build_ai_payload(snapshot):
         ud = c.get("uptime_days")
         recent = isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS
         return (c["status"] == "running" and c["health"] in ("healthy", "none")
-                and not c.get("oom_killed") and not recent and not c.get("restarts_delta"))
+                and not c.get("oom_killed") and not recent and not c.get("restarts_delta")
+                and not c.get("restarted_since_last"))
 
     # notable = 有非常态特征的容器（未运行/不健康/OOM/最近重启/上次巡检以来有新重启）
     notable = []
@@ -728,6 +797,8 @@ def build_ai_payload(snapshot):
                 "oom_killed": c["oom_killed"],
                 "uptime_days": c.get("uptime_days"),
                 "restarts_delta": c.get("restarts_delta"),
+                "restarted_since_last": c.get("restarted_since_last"),
+                "started_at": c.get("started_at"),
                 "mem_mb": c.get("mem_mb"),
                 "swap_mb": c.get("swap_mb"),
             })
@@ -759,6 +830,8 @@ def build_ai_payload(snapshot):
                         "exit 0 退出的容器多为一次性任务。restarts 是累计值（长期累积属常态），restarts_delta 才是"
                         "上次巡检以来的新增重启。host.swap_io 是换页速率：swap 已用量高但换页速率≈0 表示历史残留，"
                         "不等于当前内存压力。mem_mb/swap_mb 为各容器 cgroup 实测值（MB）。"
+                        "restarted_since_last=true 且 restarts_delta=0 表示非崩溃的重启（手动/重建/定时任务）。"
+                        "host.disk_trend 是磁盘增速（GB/天，线性回归）及到达 WARN/CRIT 阈值的预计天数与日期。"
                         "cloudwatch 是 AWS 侧看到的本 EC2 实例指标（5 分钟粒度，latest 与近 1h/24h 的 avg/min/max，"
                         "单位见 unit），用于和本机信号交叉印证；cloudwatch 为 null 表示未启用。"),
     }
@@ -782,6 +855,10 @@ def _system_prompt():
         "2) 検出された異常とその影響 3) 想定原因 4) 推奨アクション(具体的に)。"
         "異常が無ければその旨を明記。前置き・挨拶は不要、1) から書き始めること。"
         "総合ステータスは rule_status（ルール判定）を基準とし、異なる判断をする場合は根拠を1行で示すこと。"
+        "コンテナ再起動・設定変更などサービスに影響する操作は、持続的な換ページ・メモリ上限への接近・"
+        "サービス異常など具体的な根拠がある場合に限り推奨し、その根拠を明記すること。"
+        "スワップ使用量だけを理由に再起動を推奨しないこと。"
+        "disk_trend がある場合は、容量到達の見込み時期と、それまでに取るべき対策（データ保持期間の見直し等）に触れること。"
     )
 
 
@@ -877,6 +954,11 @@ def render_markdown(snap, ai_text, generated_at):
     L.append("")
     d, m, s, lo = host.get("disk", {}), host.get("mem", {}), host.get("swap", {}), host.get("load", {})
     L.append(f"- ディスク: {d.get('used_pct')}% 使用 ({d.get('used_gb')}/{d.get('total_gb')} GB)")
+    tr = host.get("disk_trend")
+    if tr:
+        eta = "".join(f"、{pct}% まで約 {tr[f'days_to_{k}']} 日（{tr[f'eta_{k}']} 頃）"
+                      for k, pct in (("warn", DISK_WARN), ("crit", DISK_CRIT)) if f"days_to_{k}" in tr)
+        L.append(f"- ディスク増加: {tr['gb_per_day']:+} GB/日（過去 {tr['span_days']} 日・{tr['points']} 点）{eta}")
     L.append(f"- メモリ: {m.get('used_pct')}% 使用 (空き {m.get('available_gb')} GB / 全 {m.get('total_gb')} GB)")
     L.append(f"- swap: {s.get('used_pct')}% 使用 ({s.get('used_gb')}/{s.get('total_gb')} GB)")
     sio = host.get("swap_io", {})
@@ -888,7 +970,7 @@ def render_markdown(snap, ai_text, generated_at):
     # 容器
     L.append("## コンテナ状態")
     L.append("")
-    L.append("Restarts は累計（括弧内は前回巡検からの増分、— は比較データなし）。")
+    L.append("Restarts は累計（括弧内は前回巡検からの増分、— は比較データなし。🔄 = 前回巡検以降に手動/再作成等で再起動）。")
     L.append("")
     L.append("| Container | Core | Status | Health | Uptime(d) | Restarts | Mem MB | Swap MB | OOM |")
     L.append("|-----------|------|--------|--------|-----------|----------|--------|---------|-----|")
@@ -900,7 +982,7 @@ def render_markdown(snap, ai_text, generated_at):
         st = c["status"] + (f" ({c.get('exit_code')})" if c["status"] == "exited" else "")
         mark = "(ignored)" if c.get("ignored") else ("★" if c["watched"] else "")
         rd = c.get("restarts_delta")
-        rs = f"{c['restarts']} ({'+' + str(rd) if rd else _v(rd)})"
+        rs = f"{c['restarts']} ({'+' + str(rd) if rd else _v(rd)})" + (" 🔄" if c.get("restarted_since_last") else "")
         L.append(f"| {c['name']} | {mark} | {st} | {c['health']} | {_v(c.get('uptime_days'))} | {rs} | "
                  f"{_v(c.get('mem_mb'))} | {_v(c.get('swap_mb'))} | {'⚠️' if c['oom_killed'] else ''} |")
     L.append("")
@@ -977,6 +1059,8 @@ def main():
     prev = load_state()
 
     host = collect_host()
+    disk_hist = update_disk_history(prev, host.get("disk", {}), t0)
+    host["disk_trend"] = disk_trend(disk_hist, host.get("disk", {}))
     cinfo, containers = collect_containers()
     collect_container_mem(containers)
     apply_restart_delta(containers, prev)
@@ -1039,7 +1123,7 @@ def main():
     stamp = now.strftime("%Y%m%d_%H%M%S")
     with open(os.path.join(OUT_DIR, f"health_{stamp}.json"), "w", encoding="utf-8") as f:
         json.dump(snapshot, f, ensure_ascii=False, indent=2)
-    save_state(prev, containers, not cinfo.get("error"), vm1, t1)
+    save_state(prev, containers, not cinfo.get("error"), vm1, t1, disk_hist)
     with open(os.path.join(OUT_DIR, f"health_{stamp}.md"), "w", encoding="utf-8") as f:
         f.write(md)
     with open(os.path.join(OUT_DIR, "health_latest.md"), "w", encoding="utf-8") as f:
