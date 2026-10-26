@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-platform_health.py — 自建 Sentry + PostHog 平台健康巡检（运维视角 · 第一步）
+platform_health.py — 自前ホストの Sentry + PostHog プラットフォーム健康巡検
 
-目标：定期检查这台 EC2 上 Sentry / PostHog 平台是否正常运行，异常时由 AI 点出
-      可能原因与处理建议。数据全部来自本机，无需 Sentry/PostHog 的 API token。
+目的：この EC2 上の Sentry / PostHog が正常に稼働しているかを定期的に点検し、
+      異常があれば AI が想定原因と対処案を示す。
 
-采集三类信号：
-  1) 容器健康：docker 各容器的 status / health / 重启次数 / 是否被 OOM kill
-  2) 主机资源：磁盘、内存、swap、load（读 /proc 与 statvfs，零依赖）
-  3) 网页可用性：对 Sentry / PostHog 的 URL 做 HTTP 探活（状态码 + 延迟）
+収集する信号：
+  1) コンテナ：status / health / 再起動（増分・非クラッシュ再起動）/ OOM / メモリ・swap 使用量
+  2) ホスト：ディスク（増加速度と閾値到達予測）、メモリ、swap（使用量と換ページ速度）、load
+  3) Web：Sentry / PostHog の /_health 疎通（ステータスコード + レイテンシ）
+  4) nginx アクセスログ：前回巡検以降のリクエスト数と 5xx
+  5) CloudWatch：EC2 インスタンス指標と本インスタンスのアラーム
 
-设计同样遵循资源受限原则：零第三方依赖、短命进程、产物极小、自动清理。
+設計方針：外部依存ゼロ（標準ライブラリ + aws CLI）、短命プロセス、成果物は極小で自動削除。
 
-用法：
-  # 只巡检+聚合，不调 LLM（先验证采集正常）
+使い方：
+  # 収集とルール判定のみ（LLM を呼ばない。まず収集の確認に）
   python3 platform_health.py --dry-run
-  # 加 AI 诊断（AI_PROVIDER=gemini 需 GEMINI_API_KEY；=anthropic 需 ANTHROPIC_API_KEY）
+  # AI 診断あり（AI_PROVIDER=gemini は GEMINI_API_KEY、=anthropic は ANTHROPIC_API_KEY が必要）
   python3 platform_health.py
 
-注意：读取 docker 信息通常需要权限。若你平时用 `sudo docker`，
-      则用 `sudo python3 platform_health.py`（.env 由脚本自行读取，无需 -E），
-      或把运行用户加入 docker 组。
+注意：docker 情報の取得には権限が必要。普段 `sudo docker` を使っているなら
+      `sudo python3 platform_health.py` で実行する（.env はスクリプト自身が読むので -E は不要）。
+      または実行ユーザーを docker グループに追加する。
 """
 
 import os
@@ -41,8 +43,8 @@ from urllib import request, error
 
 
 # ----------------------------------------------------------------------------
-# 自动加载同目录 .env（已存在的环境变量优先，不覆盖；空值忽略）
-# 放在读取配置之前；sudo 会清空环境变量，所以由脚本自己读文件最可靠。
+# 同じディレクトリの .env を自動で読み込む（既存の環境変数が優先、空の値は無視）
+# 設定を読む前に実行する。sudo は環境変数を消すため、スクリプト自身がファイルを読むのが確実。
 # ----------------------------------------------------------------------------
 def _load_dotenv():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -54,7 +56,7 @@ def _load_dotenv():
                     continue
                 k, v = line.split("=", 1)
                 v = v.split(" #", 1)[0].strip().strip('"').strip("'")
-                if v:  # 空值视为未设置，走代码默认值（如 OUT_DIR=）
+                if v:  # 空の値は未設定とみなし、コードの既定値を使う（例：OUT_DIR=）
                     os.environ.setdefault(k.strip(), v)
     except FileNotFoundError:
         pass
@@ -63,93 +65,93 @@ def _load_dotenv():
 _load_dotenv()
 
 # ----------------------------------------------------------------------------
-# 配置（环境变量）
+# 設定（環境変数）
 # ----------------------------------------------------------------------------
-# 平台核心容器（名称包含即匹配，用于标 ★）。注意别写 sentry/posthog 这种所有容器都含的词，否则 ★ 失去区分意义。
+# コアコンテナ（名前に含まれていれば一致、★ を付ける）。sentry / posthog のように全コンテナが含む語は書かないこと（★ の意味がなくなる）。
 WATCH_PREFIXES = os.environ.get(
     "WATCH_PREFIXES",
     "-web-,-nginx-,-relay-,-postgres-,-db-,-pgbouncer-,-kafka-,-clickhouse-,-redis,"
     "-snuba-api-,-taskworker-,-capture-,-ingestion-",
 ).split(",")
-# 完全不参与判定的容器（逗号分隔，名称包含即匹配），用于已知的一次性/废弃容器
+# 判定から完全に除外するコンテナ（カンマ区切り、名前に含まれていれば一致）。既知の一回限り・廃止済みコンテナ用
 IGNORE_CONTAINERS = [p.strip() for p in os.environ.get("IGNORE_CONTAINERS", "").split(",") if p.strip()]
 
-# 网页探活目标：格式 "名称=URL"，多个用逗号分隔。留空则不做网页检查。
-# 例：SENTRY_URL / POSTHOG_URL 单独给也行
+# Web 疎通の対象：「名前=URL」をカンマ区切りで。空なら Web チェックなし。
+# SENTRY_URL / POSTHOG_URL を個別に指定してもよい
 WEB_TARGETS = os.environ.get("WEB_TARGETS", "")
 SENTRY_URL = os.environ.get("SENTRY_URL", "")
 POSTHOG_URL = os.environ.get("POSTHOG_URL", "")
 
-# 关注提示的阈值（★注意：这些不是「告警通道」——实时告警由已有的 slack_alert.sh 负责。
-#  这里只是给 AI 的「关注提示」，用于聚焦分析和算总合状态。阈值刻意对齐 slack_alert.sh，
-#  避免两套数值漂移。改阈值时请同时改 slack_alert.sh，保持单一心智模型。）
-DISK_WARN = float(os.environ.get("DISK_WARN", "85"))          # 磁盘使用率 %（同 Slack DISK_WARN_PCT）
-DISK_CRIT = float(os.environ.get("DISK_CRIT", "95"))          # 同 Slack DISK_CRIT_PCT
-MEM_AVAIL_WARN_GB = float(os.environ.get("MEM_AVAIL_WARN_GB", "2"))  # 可用内存 < N GB（同 Slack RAM_WARN_GB）
-MEM_AVAIL_CRIT_GB = float(os.environ.get("MEM_AVAIL_CRIT_GB", "1"))  # 同 Slack RAM_CRIT_GB
-SWAP_WARN_GB = float(os.environ.get("SWAP_WARN_GB", "8"))     # swap 已用 ≥ N GiB（同 Slack SWAP_WARN_GB）
-SWAP_CRIT_GB = float(os.environ.get("SWAP_CRIT_GB", "10"))    # 同 Slack SWAP_CRIT_GB
-LOAD_PER_CPU_WARN = float(os.environ.get("LOAD_PER_CPU_WARN", "1.5"))  # 每核 load
-RECENT_RESTART_DAYS = float(os.environ.get("RECENT_RESTART_DAYS", "1"))  # uptime < N 天视为「最近重启」
-WEB_LATENCY_WARN_MS = int(os.environ.get("WEB_LATENCY_WARN_MS", "5000"))  # 网页/健康端点响应过慢阈值
-# 以下为本脚本独有（Slack 不管的「趋势/活动」类信号，依赖上次巡检的 state.json）
-SWAP_IO_WARN_KBPS = float(os.environ.get("SWAP_IO_WARN_KBPS", "1024"))  # 上次巡检以来 swap 换入+换出平均 KB/s
-RESTART_DELTA_CRIT = int(os.environ.get("RESTART_DELTA_CRIT", "3"))  # 上次巡检以来新增重启 ≥N → CRIT（≥1 → WARN）
-TOP_MEM_N = int(os.environ.get("TOP_MEM_N", "8"))                     # 发给 AI 的内存占用前 N 名容器
-DISK_TREND_DAYS = float(os.environ.get("DISK_TREND_DAYS", "14"))      # 磁盘增速按最近 N 天的样本线性回归
-DISK_FORECAST_WARN_DAYS = float(os.environ.get("DISK_FORECAST_WARN_DAYS", "30"))  # 预计 N 天内到达 DISK_WARN → WARN
+# 注目ポイントの閾値（★これは「リアルタイム通知」ではない。リアルタイム通知は既存の slack_alert.sh が担当。
+#  ここでは AI への注目ポイントと総合ステータスの算出に使う。数値は slack_alert.sh と意図的に揃えており、
+#  閾値を変えるときは slack_alert.sh も同時に変えること。）
+DISK_WARN = float(os.environ.get("DISK_WARN", "85"))          # ディスク使用率 %（Slack の DISK_WARN_PCT と同じ）
+DISK_CRIT = float(os.environ.get("DISK_CRIT", "95"))          # Slack の DISK_CRIT_PCT と同じ
+MEM_AVAIL_WARN_GB = float(os.environ.get("MEM_AVAIL_WARN_GB", "2"))  # 空きメモリ < N GiB（Slack の RAM_WARN_GB と同じ）
+MEM_AVAIL_CRIT_GB = float(os.environ.get("MEM_AVAIL_CRIT_GB", "1"))  # Slack の RAM_CRIT_GB と同じ
+SWAP_WARN_GB = float(os.environ.get("SWAP_WARN_GB", "8"))     # swap 使用量 ≥ N GiB（Slack の SWAP_WARN_GB と同じ）
+SWAP_CRIT_GB = float(os.environ.get("SWAP_CRIT_GB", "10"))    # Slack の SWAP_CRIT_GB と同じ
+LOAD_PER_CPU_WARN = float(os.environ.get("LOAD_PER_CPU_WARN", "1.5"))  # コアあたり load
+RECENT_RESTART_DAYS = float(os.environ.get("RECENT_RESTART_DAYS", "1"))  # uptime < N 日を「最近再起動」とみなす
+WEB_LATENCY_WARN_MS = int(os.environ.get("WEB_LATENCY_WARN_MS", "5000"))  # Web / ヘルス端点の応答遅延の閾値
+# 以下は本スクリプト独自（Slack が扱わない「傾向・活動」系の信号。前回巡検の state.json に依存）
+SWAP_IO_WARN_KBPS = float(os.environ.get("SWAP_IO_WARN_KBPS", "1024"))  # 前回巡検以降の swap 換入+換出の平均 KB/s
+RESTART_DELTA_CRIT = int(os.environ.get("RESTART_DELTA_CRIT", "3"))  # 前回巡検以降の再起動増分 ≥N → CRIT（≥1 → WARN）
+TOP_MEM_N = int(os.environ.get("TOP_MEM_N", "8"))                     # AI に渡すメモリ使用量上位 N コンテナ
+DISK_TREND_DAYS = float(os.environ.get("DISK_TREND_DAYS", "14"))      # ディスク増加速度は直近 N 日のサンプルで線形回帰
+DISK_FORECAST_WARN_DAYS = float(os.environ.get("DISK_FORECAST_WARN_DAYS", "30"))  # N 日以内に DISK_WARN 到達見込み → WARN
 
 # AI
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").strip().lower()   # gemini | anthropic
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")  # 主模型重试仍失败时改用（空=不降级）
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")  # 主モデルが再試行後も失敗したときに使う（空 = 降格しない）
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 REPORT_LANG = os.environ.get("REPORT_LANG", "ja")
 
-# 产物
+# 成果物
 OUT_DIR = os.environ.get("OUT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "out"))
 KEEP_DAYS = int(os.environ.get("KEEP_DAYS", "14"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
-# slack_alert.sh 里给部分容器设的内存阈值（GiB），格式同其 CONTAINERS 数组；改动时两边一起改
+# slack_alert.sh が一部コンテナに設定しているメモリ閾値（GiB）。形式は同スクリプトの CONTAINERS 配列と同じ。変更時は両方を直す
 CONTAINER_MEM_BUDGETS = os.environ.get(
     "CONTAINER_MEM_BUDGETS",
     "posthog-web-1:5,posthog-clickhouse-1:2,sentry-self-hosted-web-1:1.5,sentry-self-hosted-snuba-api-1:2")
-BUDGET_INFO_PCT = float(os.environ.get("BUDGET_INFO_PCT", "80"))   # 占阈值 ≥ N% → INFO（Slack 在 95% 持续时实时报）
+BUDGET_INFO_PCT = float(os.environ.get("BUDGET_INFO_PCT", "80"))   # 閾値の N% 以上 → INFO（Slack は 95% 継続でリアルタイム通知）
 
-# nginx 访问日志的 5xx 统计（窗口 = 上次巡检以来，最长 NGINX_MAX_WINDOW_H 小时）
+# nginx アクセスログの 5xx 集計（窓 = 前回巡検以降、最長 NGINX_MAX_WINDOW_H 時間）
 NGINX_CONTAINERS = [c.strip() for c in os.environ.get("NGINX_CONTAINERS", "sentry-self-hosted-nginx-1").split(",") if c.strip()]
 NGINX_MAX_WINDOW_H = float(os.environ.get("NGINX_MAX_WINDOW_H", "24"))
-NGINX_5XX_WARN_PCT = float(os.environ.get("NGINX_5XX_WARN_PCT", "1"))    # 5xx 占比 ≥ N% 且
-NGINX_5XX_WARN_MIN = int(os.environ.get("NGINX_5XX_WARN_MIN", "20"))     # 件数 ≥ N → WARN；否则有 5xx 只记 INFO
+NGINX_5XX_WARN_PCT = float(os.environ.get("NGINX_5XX_WARN_PCT", "1"))    # 5xx 比率 ≥ N% かつ
+NGINX_5XX_WARN_MIN = int(os.environ.get("NGINX_5XX_WARN_MIN", "20"))     # 件数 ≥ N → WARN。それ以外で 5xx があれば INFO
 
-# Slack 通知：只在状态变化时发（WARN/CRIT 新增或消除、总合状态改变）。留空则不发
+# Slack 通知：状態が変わったときだけ送る（WARN/CRIT の新規・解消、総合ステータスの変化）。空なら送らない
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
-GIB, MIB = 1024 ** 3, 1024 ** 2   # 容量统一用二进制单位（同 docker stats / df -h / slack_alert.sh）
-STATE_FILE = os.path.join(OUT_DIR, "state.json")   # 上次巡检的计数器（重启次数 / swap 换页），用于算增量
+GIB, MIB = 1024 ** 3, 1024 ** 2   # 容量は二進単位に統一（docker stats / df -h / slack_alert.sh と同じ）
+STATE_FILE = os.path.join(OUT_DIR, "state.json")   # 前回巡検のカウンタ（再起動回数 / swap 換ページ等）。増分の計算に使う
 
-# CloudWatch（经 aws CLI；需要实例角色有 cloudwatch:GetMetricData / cloudwatch:DescribeAlarms）
-CLOUDWATCH = os.environ.get("CLOUDWATCH", "1") != "0"          # 0 = 完全不查 CloudWatch
-CW_INSTANCE_ID = os.environ.get("CW_INSTANCE_ID", "")          # 留空则从 IMDS 自动取
-CW_REGION = os.environ.get("AWS_REGION", "") or os.environ.get("AWS_DEFAULT_REGION", "")  # 留空则从 IMDS 取
-CW_CPU_WARN = float(os.environ.get("CW_CPU_WARN", "80"))        # 近 1h CPU 平均 % ≥ → WARN
-CW_BALANCE_WARN = float(os.environ.get("CW_BALANCE_WARN", "20"))  # EBS IO/Byte 突发余额 % ≤ → WARN（将被限速）
-CW_CPU_CREDIT_WARN = float(os.environ.get("CW_CPU_CREDIT_WARN", "10"))  # T 系 CPU credit 余额 ≤ → WARN
+# CloudWatch（aws CLI 経由。インスタンスロールに cloudwatch:GetMetricData / cloudwatch:DescribeAlarms が必要）
+CLOUDWATCH = os.environ.get("CLOUDWATCH", "1") != "0"          # 0 = CloudWatch を参照しない
+CW_INSTANCE_ID = os.environ.get("CW_INSTANCE_ID", "")          # 空なら IMDS から自動取得
+CW_REGION = os.environ.get("AWS_REGION", "") or os.environ.get("AWS_DEFAULT_REGION", "")  # 空なら IMDS から取得
+CW_CPU_WARN = float(os.environ.get("CW_CPU_WARN", "80"))        # 直近 1h の CPU 平均 % ≥ → WARN
+CW_BALANCE_WARN = float(os.environ.get("CW_BALANCE_WARN", "20"))  # EBS IO/Byte バースト残高 % ≤ → WARN（枯渇すると帯域制限）
+CW_CPU_CREDIT_WARN = float(os.environ.get("CW_CPU_CREDIT_WARN", "10"))  # T 系の CPU クレジット残高 ≤ → WARN
 INSECURE = os.environ.get("WEB_INSECURE", "") == "1"
 
 
 # ----------------------------------------------------------------------------
-# 1) 容器健康
+# 1) コンテナ
 # ----------------------------------------------------------------------------
 def _uptime_days(started_at):
-    """把 docker 的 StartedAt（可能带纳秒）换成「已运行天数」，解析失败返回 None。"""
+    """docker の StartedAt（ナノ秒付きの場合あり）を「稼働日数」に変換。解析失敗時は None。"""
     try:
         s = started_at.rstrip("Z")
         if "." in s:
             head, frac = s.split(".", 1)
-            s = head + "." + frac[:6]        # 纳秒截到微秒，strptime 才认
+            s = head + "." + frac[:6]        # strptime が扱えるようナノ秒をマイクロ秒に切り詰める
             fmt = "%Y-%m-%dT%H:%M:%S.%f"
         else:
             fmt = "%Y-%m-%dT%H:%M:%S"
@@ -160,25 +162,25 @@ def _uptime_days(started_at):
 
 
 def _short(text, n=300):
-    """错误信息只留首尾要点，避免把整条命令/上百行输出塞进报告。"""
+    """エラーメッセージを短く整形する（コマンド全体や大量の出力をレポートに載せないため）。"""
     t = " ".join((text or "").split())
     return t if len(t) <= n else t[:n] + "…"
 
 
 def collect_containers():
-    """用 docker inspect 采集所有容器的关键状态。docker 不可用则返回错误标记。"""
+    """docker inspect で全コンテナの主要な状態を取得する。docker が使えない場合はエラーを返す。"""
     if shutil.which("docker") is None:
-        return {"error": "docker 命令不可用（PATH 中找不到）"}, []
-    # 先列出所有容器（含已停止）的完整 ID 与名称。ID 从 ps 取：{{.ID}} 是 ps 格式里最通用的写法
+        return {"error": "docker コマンドが使えない（PATH に見つからない）"}, []
+    # まず全コンテナ（停止中を含む）の完全な ID と名前を取得。ID は ps から取る（{{.ID}} は ps 形式で最も互換性が高い）
     try:
         ps_out = subprocess.run(
             ["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"],
             capture_output=True, text=True, timeout=20, check=True,
         ).stdout
     except subprocess.CalledProcessError as e:
-        return {"error": f"docker ps 失败：{_short(e.stderr) or e.returncode}"}, []
+        return {"error": f"docker ps 失敗：{_short(e.stderr) or e.returncode}"}, []
     except Exception as e:  # noqa
-        return {"error": f"docker ps 异常：{e}"}, []
+        return {"error": f"docker ps 例外：{e}"}, []
 
     ids = {}
     for line in ps_out.splitlines():
@@ -187,9 +189,9 @@ def collect_containers():
             ids[name.strip()] = cid.strip()
     names = list(ids)
     if not names:
-        return {"error": None, "note": "未发现任何容器"}, []
+        return {"error": None, "note": "コンテナが見つからない"}, []
 
-    # 一次 inspect 全部，输出可解析的分隔行
+    # 一度の inspect で全件を取得し、区切り文字付きの行で出力
     fmt = ("{{.Name}}\t{{.State.Status}}\t"
            "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}\t"
            "{{.RestartCount}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}\t{{.State.ExitCode}}")
@@ -197,10 +199,10 @@ def collect_containers():
         r = subprocess.run(["docker", "inspect", "--format", fmt] + names,
                            capture_output=True, text=True, timeout=30)
     except Exception as e:  # noqa
-        return {"error": f"docker inspect 异常：{e}"}, []
+        return {"error": f"docker inspect 例外：{e}"}, []
     insp = r.stdout
-    # 非 0 退出也先解析已有输出（例如 ps 与 inspect 之间有容器被删掉，只影响那一个）
-    inspect_err = f"docker inspect 失败（exit {r.returncode}）：{_short(r.stderr)}" if r.returncode else None
+    # 非 0 終了でも取得できた出力は解析する（ps と inspect の間に削除されたコンテナがあっても、その 1 件だけの影響で済む）
+    inspect_err = f"docker inspect 失敗（exit {r.returncode}）：{_short(r.stderr)}" if r.returncode else None
 
     containers = []
     for line in insp.splitlines():
@@ -228,17 +230,17 @@ def collect_containers():
     if inspect_err and not containers:
         return {"error": inspect_err}, []
     if inspect_err:
-        print(f"[warn] {inspect_err}（已解析 {len(containers)}/{len(names)} 个容器）", file=sys.stderr)
+        print(f"[warn] {inspect_err}（{len(containers)}/{len(names)} コンテナを解析済み）", file=sys.stderr)
     return {"error": None, "partial": inspect_err}, containers
 
 
 # ----------------------------------------------------------------------------
-# 2) 主机资源（零依赖：statvfs + /proc）
+# 2) ホストリソース（依存なし：statvfs + /proc）
 # ----------------------------------------------------------------------------
 def collect_host():
     host = {}
-    # 磁盘（根分区）。口径同 `df`（slack_alert.sh 用的就是 df 的 Use%）：
-    #   used = 总块 - 空闲块；Use% = ceil(used / (used + 普通用户可用))，保留块不计入分母
+    # ディスク（ルート）。算出方法は `df` と同じ（slack_alert.sh は df の Use% を使っている）：
+    #   used = 全ブロック - 空きブロック、Use% = ceil(used / (used + 一般ユーザー利用可能))。予約ブロックは分母に含めない
     try:
         st = os.statvfs("/")
         used = (st.f_blocks - st.f_bfree) * st.f_frsize
@@ -252,7 +254,7 @@ def collect_host():
     except Exception as e:  # noqa
         host["disk"] = {"error": str(e)}
 
-    # 内存 / swap（/proc/meminfo，单位 kB）
+    # メモリ / swap（/proc/meminfo、単位 kB）
     try:
         mi = {}
         with open("/proc/meminfo") as f:
@@ -261,7 +263,7 @@ def collect_host():
                 mi[k.strip()] = int(v.strip().split()[0])
         mem_total = mi.get("MemTotal", 0)
         mem_avail = mi.get("MemAvailable", 0)
-        host["mem"] = {   # /proc/meminfo 为 KiB → GiB（同 slack_alert.sh 的 ÷1048576）
+        host["mem"] = {   # /proc/meminfo は KiB → GiB（slack_alert.sh の ÷1048576 と同じ）
             "total_gib": round(mem_total / 1048576, 1),
             "available_gib": round(mem_avail / 1048576, 2),
             "used_pct": round((mem_total - mem_avail) / mem_total * 100, 1) if mem_total else None,
@@ -288,7 +290,7 @@ def collect_host():
 
 
 # ----------------------------------------------------------------------------
-# 1b) 容器内存 / swap（cgroup v2 直读，零开销；读不到时退回 docker stats，仅内存）
+# 1b) コンテナのメモリ / swap（cgroup v2 を直接読む。読めない場合は docker stats で代替、メモリのみ）
 # ----------------------------------------------------------------------------
 def _read_cg_int(path):
     with open(path) as f:
@@ -297,7 +299,7 @@ def _read_cg_int(path):
 
 
 def _cgroup_dir(cid):
-    # systemd cgroup driver（Amazon Linux 2023 等默认） / cgroupfs driver
+    # systemd cgroup ドライバ（Amazon Linux 2023 等の既定） / cgroupfs ドライバ
     for d in (f"/sys/fs/cgroup/system.slice/docker-{cid}.scope", f"/sys/fs/cgroup/docker/{cid}"):
         if os.path.isdir(d):
             return d
@@ -308,7 +310,7 @@ _SIZE_UNITS = {"b": 1, "kb": 1e3, "mb": 1e6, "gb": 1e9, "kib": 1024, "mib": 1024
 
 
 def _parse_size(text):
-    """'1.23GiB' → 字节数。"""
+    """'1.23GiB' → バイト数。"""
     t = text.strip().lower()
     for u in sorted(_SIZE_UNITS, key=len, reverse=True):
         if t.endswith(u):
@@ -317,7 +319,7 @@ def _parse_size(text):
 
 
 def collect_container_mem(containers):
-    """给运行中容器补上 mem_mib / swap_mib / mem_limit_mib（口径同 docker stats：memory.current - inactive_file）。"""
+    """稼働中コンテナに mem_mib / swap_mib / mem_limit_mib を付与する（docker stats と同じ算出：memory.current - inactive_file）。"""
     found = 0
     for c in containers:
         if c["status"] != "running" or not c.get("id"):
@@ -344,7 +346,7 @@ def collect_container_mem(containers):
             continue
     if found or not any(c["status"] == "running" for c in containers):
         return
-    # cgroup 读不到（cgroup v1 等）→ docker stats 兜底，约 2 秒
+    # cgroup が読めない（cgroup v1 等）→ docker stats で代替（約 2 秒）
     try:
         out = subprocess.run(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}"],
                              capture_output=True, text=True, timeout=30, check=True).stdout
@@ -379,8 +381,8 @@ def apply_mem_budgets(containers):
 
 
 # ----------------------------------------------------------------------------
-# 1c) swap 换入/换出活动（/proc/vmstat 的累计页数 → 速率）
-#     「swap 已用量」只说明曾经换出过；「换页速率」才说明现在是否有内存压力。
+# 1c) swap の換入/換出（/proc/vmstat の累計ページ数 → 速度）
+#     「swap 使用量」は過去に換出されたことを示すだけ。今メモリが逼迫しているかは「換ページ速度」で分かる。
 # ----------------------------------------------------------------------------
 PAGE_KB = os.sysconf("SC_PAGE_SIZE") / 1024 if hasattr(os, "sysconf") else 4
 
@@ -402,13 +404,13 @@ def _swap_rate(v0, v1, seconds):
     if seconds <= 0 or not v0 or not v1:
         return None
     din, dout = v1.get("pswpin", 0) - v0.get("pswpin", 0), v1.get("pswpout", 0) - v0.get("pswpout", 0)
-    if din < 0 or dout < 0:      # 重启过主机，计数器归零
+    if din < 0 or dout < 0:      # ホスト再起動でカウンタがリセットされた
         return None
     return {"in_kbps": round(din * PAGE_KB / seconds, 1), "out_kbps": round(dout * PAGE_KB / seconds, 1)}
 
 
 # ----------------------------------------------------------------------------
-# 1d) 上次巡检的状态（重启次数 / swap 计数器），用于算「增量」而不是看累计值
+# 1d) 前回巡検の状態（再起動回数 / swap カウンタ等）。累計値ではなく「増分」を見るために使う
 # ----------------------------------------------------------------------------
 def load_state():
     try:
@@ -420,7 +422,7 @@ def load_state():
 
 def save_state(prev, containers, collect_ok, vmstat, ts, disk_history, notify):
     state = {"ts": ts, "vmstat": vmstat, "disk_avail_history": disk_history, "notify": notify,
-             # 容器采集失败时沿用上次的容器计数，避免下次算出错误增量
+             # コンテナ取得に失敗したときは前回の値を引き継ぐ（次回に誤った増分を出さないため）
              "containers": ({c["name"]: {"restarts": c["restarts"], "started_at": c["started_at"]}
                              for c in containers} if collect_ok else prev.get("containers", {}))}
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -431,9 +433,9 @@ def save_state(prev, containers, collect_ok, vmstat, ts, disk_history, notify):
 
 
 def apply_restart_delta(containers, prev):
-    """restarts_delta = 上次巡检以来新增的重启次数。无上次记录 / 容器被重建（计数归零）时为 None。
-    restarted_since_last = 启动时间变了。RestartCount 只统计 restart policy 触发的重启，
-    `docker restart`、compose 重建、定时任务重启都不会让它增加，只能靠启动时间发现。"""
+    """restarts_delta = 前回巡検以降の再起動回数の増分。前回の記録がない / コンテナ再作成（カウンタが 0 に戻る）の場合は None。
+    restarted_since_last = 起動時刻が変わった。RestartCount は restart policy による再起動しか数えないため、
+    `docker restart`・compose による再作成・定期ジョブによる再起動は起動時刻の変化でしか分からない。"""
     pc = prev.get("containers", {})
     for c in containers:
         p = pc.get(c["name"])
@@ -447,10 +449,10 @@ def apply_restart_delta(containers, prev):
 
 
 # ----------------------------------------------------------------------------
-# 1e) 磁盘增速与到达阈值的预测（样本存 state.json；首次时从 out/ 里的历史快照补种）
+# 1e) ディスク増加速度と閾値到達の予測（サンプルは state.json に保存。初回は out/ の過去スナップショットから補完）
 # ----------------------------------------------------------------------------
 def _seed_disk_history():
-    """从 out/ 的历史快照补种「可用空间 GiB」样本。兼容旧格式（十进制 GB 的 total_gb/used_gb）。"""
+    """out/ の過去スナップショットから「空き容量 GiB」のサンプルを補完する。旧形式（十進 GB の total_gb/used_gb）にも対応。"""
     hist = []
     try:
         names = sorted(n for n in os.listdir(OUT_DIR) if n.startswith("health_2") and n.endswith(".json"))
@@ -469,7 +471,7 @@ def _seed_disk_history():
 
 
 def update_disk_history(prev, disk, ts):
-    # 记录「可用空间」而不是「已用量」：不受口径（是否计保留块）和单位变化影响，曲线不会断
+    # 「使用量」ではなく「空き容量」を記録する：算出方法（予約ブロックの扱い）や単位が変わっても系列が途切れない
     hist = prev.get("disk_avail_history") or _seed_disk_history()
     if isinstance(disk.get("avail_gib"), (int, float)):
         hist.append([ts, disk["avail_gib"]])
@@ -478,7 +480,7 @@ def update_disk_history(prev, disk, ts):
 
 
 def disk_trend(hist, disk):
-    """最小二乘求每天消耗的 GiB，并预测 Use%（df 口径）到达 DISK_WARN / DISK_CRIT 的天数。样本跨度不足 12 小时则不算。"""
+    """最小二乗法で 1 日あたりの消費 GiB を求め、Use%（df 方式）が DISK_WARN / DISK_CRIT に達するまでの日数を予測する。サンプル期間が 12 時間未満なら計算しない。"""
     used, avail = disk.get("used_gib"), disk.get("avail_gib")
     if len(hist) < 2 or used is None or avail is None or hist[-1][0] - hist[0][0] < 12 * 3600:
         return None
@@ -486,9 +488,9 @@ def disk_trend(hist, disk):
     ys = [a for _, a in hist]
     mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
     var = sum((x - mx) ** 2 for x in xs)
-    growth = -sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var   # 可用空间减少速度 = 增长速度
+    growth = -sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var   # 空き容量の減少速度 = 増加速度
     out = {"gib_per_day": round(growth, 2), "span_days": round(xs[-1], 1), "points": len(hist)}
-    cap = used + avail     # df 的 Use% 分母
+    cap = used + avail     # df の Use% の分母
     for key, pct in (("warn", DISK_WARN), ("crit", DISK_CRIT)):
         remain = avail - cap * (1 - pct / 100)
         if growth > 0.01 and remain > 0:
@@ -500,7 +502,7 @@ def disk_trend(hist, disk):
 
 
 # ----------------------------------------------------------------------------
-# 3) 网页可用性
+# 3) Web 疎通
 # ----------------------------------------------------------------------------
 def _ssl_ctx():
     if INSECURE:
@@ -538,7 +540,7 @@ def collect_web():
                 rec["ok"] = 200 <= resp.status < 400
         except error.HTTPError as e:
             rec["status"] = e.code
-            rec["ok"] = False  # 4xx/5xx 也算「有响应」，但标记 ok=False
+            rec["ok"] = False  # 4xx/5xx も「応答あり」だが ok=False とする
         except Exception as e:  # noqa
             rec["status"] = None
             rec["ok"] = False
@@ -549,8 +551,8 @@ def collect_web():
 
 
 # ----------------------------------------------------------------------------
-# 3b) nginx 访问日志：窗口内请求数与 5xx（流式计数，内存有界）
-#     路径去掉 query（Sentry 的上报 URL 带 sentry_key），数字段归一为 {n} 便于聚合
+# 3b) nginx アクセスログ：窓内のリクエスト数と 5xx（ストリームで数えるのでメモリ使用は一定）
+#     パスはクエリを除去（Sentry の送信 URL には sentry_key が含まれる）、数字部分は {n} に正規化して集計
 # ----------------------------------------------------------------------------
 _ACCESS_RE = re.compile(r'"([A-Z]+) (\S+) [^"]*" (\d{3}) ')
 
@@ -599,13 +601,13 @@ def collect_nginx(window_s):
 
 
 # ----------------------------------------------------------------------------
-# 4) CloudWatch：AWS 侧看到的 EC2 实例指标 + 与本实例相关的 CloudWatch 告警
-#    经 aws CLI 调用（Amazon Linux 自带），保持零第三方依赖。
-#    本机信号看「容器/进程内部」，CloudWatch 看「实例外部」（网络、EBS 限速、状态检查、CPU credit）。
+# 4) CloudWatch：AWS 側から見た EC2 インスタンス指標 + 本インスタンスに紐づく CloudWatch アラーム
+#    aws CLI（Amazon Linux に標準搭載）経由で呼び、外部 Python 依存を増やさない。
+#    ローカル信号は「コンテナ/プロセスの内側」、CloudWatch は「インスタンスの外側」（ネットワーク、EBS 制限、状態チェック、CPU クレジット）を見る。
 # ----------------------------------------------------------------------------
-CW_PERIOD = 300   # EC2 基础监控为 5 分钟粒度
+CW_PERIOD = 300   # EC2 の基本モニタリングは 5 分粒度
 CW_METRICS = [
-    # (query id, MetricName, Stat, 换算, 单位)  换算：None=原值 / "kbps"=Sum 字节÷周期÷1024 / "rate"=Sum÷周期
+    # (query id, MetricName, Stat, 換算, 単位)  換算：None=そのまま / "kbps"=Sum バイト÷期間÷1024 / "rate"=Sum÷期間
     ("cpu", "CPUUtilization", "Average", None, "%"),
     ("cpu_peak", "CPUUtilization", "Maximum", None, "%"),
     ("net_in", "NetworkIn", "Sum", "kbps", "KB/s"),
@@ -614,10 +616,10 @@ CW_METRICS = [
     ("ebs_write", "EBSWriteBytes", "Sum", "kbps", "KB/s"),
     ("ebs_read_iops", "EBSReadOps", "Sum", "rate", "IOPS"),
     ("ebs_write_iops", "EBSWriteOps", "Sum", "rate", "IOPS"),
-    ("ebs_io_balance", "EBSIOBalance%", "Minimum", None, "%"),      # 突发型 EBS 带宽余额（Nitro 小规格）
+    ("ebs_io_balance", "EBSIOBalance%", "Minimum", None, "%"),      # EBS 帯域のバースト残高（Nitro 小型インスタンス）
     ("ebs_byte_balance", "EBSByteBalance%", "Minimum", None, "%"),
-    ("cpu_credit", "CPUCreditBalance", "Minimum", None, "credits"),  # 仅 T 系实例有
-    ("status_failed", "StatusCheckFailed", "Maximum", None, ""),     # 1 = 系统/实例状态检查失败
+    ("cpu_credit", "CPUCreditBalance", "Minimum", None, "credits"),  # T 系インスタンスのみ
+    ("status_failed", "StatusCheckFailed", "Maximum", None, ""),     # 1 = システム/インスタンス状態チェック失敗
 ]
 
 
@@ -628,7 +630,7 @@ def _imds(path, token, timeout=2):
 
 
 def _instance_identity():
-    """(instance_id, region, instance_type)。环境变量优先，其余从 IMDSv2 取；不在 EC2 上则抛异常。"""
+    """(instance_id, region, instance_type)。環境変数を優先し、残りは IMDSv2 から取得。EC2 上でなければ例外。"""
     iid, region, itype = CW_INSTANCE_ID, CW_REGION, None
     try:
         tok_req = request.Request("http://169.254.169.254/latest/api/token", method="PUT",
@@ -640,7 +642,7 @@ def _instance_identity():
         itype = _imds("meta-data/instance-type", token)
     except Exception as e:  # noqa
         if not (iid and region):
-            raise RuntimeError(f"无法从 IMDS 取得实例信息（不在 EC2 上？）：{e}")
+            raise RuntimeError(f"IMDS からインスタンス情報を取得できない（EC2 上ではない？）：{e}")
     return iid, region, itype
 
 
@@ -649,12 +651,12 @@ def _aws(args, region, timeout=40):
         r = subprocess.run(["aws"] + args + ["--region", region, "--output", "json"],
                            capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"aws {args[1]} 超时（{timeout}s）") from None
+        raise RuntimeError(f"aws {args[1]} タイムアウト（{timeout}s）") from None
     if r.returncode:
         err = r.stderr
         if "AccessDenied" in err or "not authorized" in err:
-            raise RuntimeError(f"IAM 权限不足：实例角色缺少 cloudwatch:{_CW_ACTION.get(args[1], args[1])}")
-        raise RuntimeError(f"aws {args[1]} 失败：{_short(err)}")
+            raise RuntimeError(f"IAM 権限不足：インスタンスロールに cloudwatch:{_CW_ACTION.get(args[1], args[1])} がない")
+        raise RuntimeError(f"aws {args[1]} 失敗：{_short(err)}")
     return json.loads(r.stdout or "{}")
 
 
@@ -662,7 +664,7 @@ _CW_ACTION = {"get-metric-data": "GetMetricData", "describe-alarms": "DescribeAl
 
 
 def _summarize(points, conv):
-    """points: [(ts, value)] 新→旧。返回 latest + 近 1h / 24h 的 avg/min/max（已换算单位）。"""
+    """points: [(ts, value)] 新→旧。latest と直近 1h / 24h の avg/min/max を返す（単位換算済み）。"""
     if not points:
         return None
     f = (lambda v: v / CW_PERIOD / 1024) if conv == "kbps" else (lambda v: v / CW_PERIOD) if conv == "rate" else (lambda v: v)
@@ -680,12 +682,12 @@ def _parse_cw_ts(s):
 
 
 def collect_cloudwatch():
-    """返回 None（已用 CLOUDWATCH=0 关闭）或 dict。失败不抛异常，写进 error 字段，其余巡检照常。"""
+    """None（CLOUDWATCH=0 で無効）または dict を返す。失敗しても例外は投げず error に記録し、他の巡検は続行する。"""
     if not CLOUDWATCH:
         return None
     cw = {"error": None}
     if shutil.which("aws") is None:
-        cw["error"] = "aws CLI 不可用（PATH 中找不到）"
+        cw["error"] = "aws CLI が使えない（PATH に見つからない）"
         return cw
     try:
         iid, region, itype = _instance_identity()
@@ -694,7 +696,7 @@ def collect_cloudwatch():
         return cw
     cw.update({"instance_id": iid, "region": region, "instance_type": itype, "period_s": CW_PERIOD})
 
-    # --- 指标：一次 GetMetricData 取 24h 全部（12 指标 × 288 点，远低于单次上限）
+    # --- 指標：GetMetricData 1 回で 24h 分を取得（12 指標 × 288 点、1 回の上限を大きく下回る）
     end = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
     queries = [{"Id": qid, "ReturnData": True,
                 "MetricStat": {"Metric": {"Namespace": "AWS/EC2", "MetricName": name,
@@ -713,7 +715,7 @@ def collect_cloudwatch():
             qid = res.get("Id")
             pts = list(zip(map(_parse_cw_ts, res.get("Timestamps", [])), res.get("Values", [])))
             summ = _summarize(pts, meta[qid][3]) if qid in meta else None
-            if summ:   # 没有数据的指标（如非 T 系没有 CPUCreditBalance）直接省略
+            if summ:   # データのない指標（T 系以外の CPUCreditBalance 等）は省略
                 summ["unit"] = meta[qid][4]
                 metrics[qid] = summ
         cw["metrics"] = metrics
@@ -721,7 +723,7 @@ def collect_cloudwatch():
         cw["error"] = str(e)
         return cw
 
-    # --- 与本实例相关的 CloudWatch 告警（维度含本实例 ID）
+    # --- 本インスタンスに紐づく CloudWatch アラーム（ディメンションに本インスタンス ID を含むもの）
     try:
         alarms = _aws(["cloudwatch", "describe-alarms"], region).get("MetricAlarms", [])
         mine = [a for a in alarms if any(d.get("Value") == iid for d in a.get("Dimensions", []))]
@@ -729,13 +731,13 @@ def collect_cloudwatch():
                          "metric": a.get("MetricName"), "threshold": a.get("Threshold"),
                          "reason": _short(a.get("StateReason"), 160)} for a in mine]
     except RuntimeError as e:
-        cw["alarms_error"] = str(e)   # 告警查不到不影响指标
+        cw["alarms_error"] = str(e)   # アラームが取れなくても指標には影響しない
     return cw
 
 
 # ----------------------------------------------------------------------------
-# 计算「关注提示」（确定性规则，给 AI 聚焦用；★不是告警通道，实时告警归 slack_alert.sh）
-# 刻意只标真信号，避免与 Slack 重复，也避免累计重启这类噪音。
+# 「注目ポイント」の算出（決定的なルール。AI の分析の焦点に使う。★リアルタイム通知は slack_alert.sh の担当）
+# 本当に意味のある信号だけを拾い、Slack との重複や累計再起動回数のようなノイズを避ける。
 # ----------------------------------------------------------------------------
 def compute_alerts(host, containers, web, cw=None, nginx=None):
     alerts = []
@@ -743,151 +745,151 @@ def compute_alerts(host, containers, web, cw=None, nginx=None):
     d = host.get("disk", {})
     if isinstance(d.get("used_pct"), (int, float)):
         if d["used_pct"] >= DISK_CRIT:
-            alerts.append(f"[CRIT] 磁盘使用率 {d['used_pct']}% ≥ {DISK_CRIT}%")
+            alerts.append(f"[CRIT] ディスク使用率 {d['used_pct']}% ≥ {DISK_CRIT}%")
         elif d["used_pct"] >= DISK_WARN:
-            alerts.append(f"[WARN] 磁盘使用率 {d['used_pct']}% ≥ {DISK_WARN}%")
+            alerts.append(f"[WARN] ディスク使用率 {d['used_pct']}% ≥ {DISK_WARN}%")
     tr = host.get("disk_trend") or {}
     if "days_to_warn" in tr and tr["days_to_warn"] <= DISK_FORECAST_WARN_DAYS:
-        alerts.append(f"[WARN] 磁盘按 +{tr['gib_per_day']}GiB/天 增长，约 {tr['days_to_warn']} 天后（{tr['eta_warn']} 前后）"
-                      f"达到 {DISK_WARN}%")
+        alerts.append(f"[WARN] ディスクが +{tr['gib_per_day']}GiB/日 で増加中、約 {tr['days_to_warn']} 日後（{tr['eta_warn']} 頃）"
+                      f"に {DISK_WARN}% 到達見込み")
 
     m = host.get("mem", {})
     av = m.get("available_gib")
     if isinstance(av, (int, float)):
-        if av < MEM_AVAIL_CRIT_GB:      # slack_alert.sh：floor(GiB) < 阈值 ⇔ GiB < 阈值
-            alerts.append(f"[CRIT] 可用内存仅 {av}GiB < {MEM_AVAIL_CRIT_GB}GiB")
+        if av < MEM_AVAIL_CRIT_GB:      # slack_alert.sh：floor(GiB) < 閾値 ⇔ GiB < 閾値
+            alerts.append(f"[CRIT] 空きメモリ {av}GiB < {MEM_AVAIL_CRIT_GB}GiB")
         elif av < MEM_AVAIL_WARN_GB:
-            alerts.append(f"[WARN] 可用内存 {av}GiB < {MEM_AVAIL_WARN_GB}GiB")
+            alerts.append(f"[WARN] 空きメモリ {av}GiB < {MEM_AVAIL_WARN_GB}GiB")
 
     s = host.get("swap", {})
     sio = host.get("swap_io", {})
-    # 用换页速率给「swap 已用量」加注：已用多但几乎不换页 → 多为历史残留
-    # 优先用「上次巡检以来」的长窗口；3 秒的瞬时值易被本次巡检自身触发的换入干扰
+    # 「swap 使用量」に換ページ速度を注記する：使用量が多くてもほぼ換ページがなければ過去の残留
+    # 「前回巡検以降」の長い窓を優先する（3 秒の瞬間値は巡検自体が引き起こす換入の影響を受けやすい）
     rate = sio.get("since_last") or sio.get("now")
     hint, idle = "", False
     if rate:
         tot = round(rate["in_kbps"] + rate["out_kbps"], 1)
         idle = tot < SWAP_IO_WARN_KBPS / 10
-        hint = (f"（换页 {tot}KB/s，几乎无活动，多为历史换出的残留，已降级）" if idle
-                else f"（换页 {tot}KB/s，仍在活跃换页）")
+        hint = (f"（換ページ {tot}KB/s、ほぼ動きなし。過去に換出された残留のため 1 段階下げて表示）" if idle
+                else f"（換ページ {tot}KB/s、現在も活発に換ページ中）")
     su = s.get("used_gib")
     if isinstance(su, (int, float)):
-        # 闲置的 swap 不影响性能：降一级（WARN→INFO、CRIT→WARN），避免每次都报成噪音。
-        # Slack 的绝对阈值告警不受影响；真正的内存压力由下面的「持续换页」规则负责。
+        # 動きのない swap は性能に影響しない：1 段階下げる（WARN→INFO、CRIT→WARN）。毎回ノイズとして出るのを防ぐ。
+        # Slack の絶対閾値の通知には影響しない。実際のメモリ逼迫は下の「継続的な換ページ」ルールで検出する。
         if su >= SWAP_CRIT_GB:
-            alerts.append(f"[{'WARN' if idle else 'CRIT'}] swap 已用 {su}GiB ≥ {SWAP_CRIT_GB}GiB{hint}")
+            alerts.append(f"[{'WARN' if idle else 'CRIT'}] swap 使用量 {su}GiB ≥ {SWAP_CRIT_GB}GiB{hint}")
         elif su >= SWAP_WARN_GB:
-            alerts.append(f"[{'INFO' if idle else 'WARN'}] swap 已用 {su}GiB ≥ {SWAP_WARN_GB}GiB{hint}")
+            alerts.append(f"[{'INFO' if idle else 'WARN'}] swap 使用量 {su}GiB ≥ {SWAP_WARN_GB}GiB{hint}")
     sl = sio.get("since_last")
     if sl and sl["in_kbps"] + sl["out_kbps"] >= SWAP_IO_WARN_KBPS:
-        alerts.append(f"[WARN] 上次巡检以来 swap 持续换页：换入 {sl['in_kbps']}KB/s / 换出 {sl['out_kbps']}KB/s"
-                      f"（≥{SWAP_IO_WARN_KBPS}KB/s，存在实际内存压力）")
+        alerts.append(f"[WARN] 前回巡検以降 swap の換ページが継続：換入 {sl['in_kbps']}KB/s / 換出 {sl['out_kbps']}KB/s"
+                      f"（≥{SWAP_IO_WARN_KBPS}KB/s、実際にメモリが逼迫している）")
 
     l = host.get("load", {})
     if isinstance(l.get("per_cpu_1m"), (int, float)) and l["per_cpu_1m"] >= LOAD_PER_CPU_WARN:
-        alerts.append(f"[WARN] 每核 load {l['per_cpu_1m']}（1m {l.get('1m')} / {l.get('cpu_count')} 核）")
+        alerts.append(f"[WARN] コアあたり load {l['per_cpu_1m']}（1m {l.get('1m')} / {l.get('cpu_count')} コア）")
 
     for c in containers:
         if c.get("ignored"):
             continue
-        tag = "核心容器" if c["watched"] else "容器"
-        # OOM 不论当前状态都要报（停掉的容器恰恰可能是被 OOM 杀的）
+        tag = "コアコンテナ" if c["watched"] else "コンテナ"
+        # OOM は現在の状態に関係なく報告する（停止中のコンテナこそ OOM で落ちた可能性がある）
         if c.get("oom_killed"):
-            alerts.append(f"[CRIT] {tag} {c['name']} 曾被 OOM kill（status={c['status']}）")
+            alerts.append(f"[CRIT] {tag} {c['name']} が OOM kill された（status={c['status']}）")
         st = c["status"]
         if st != "running":
             if st == "exited" and c.get("exit_code") == 0:
-                # 正常结束：多为一次性任务（migration 等），不算故障
-                alerts.append(f"[INFO] {tag} {c['name']} 已正常退出（exit 0，可能是一次性任务；"
-                              f"如属预期可加入 IGNORE_CONTAINERS）")
+                # 正常終了：多くは一回限りのタスク（migration 等）で、障害ではない
+                alerts.append(f"[INFO] {tag} {c['name']} は正常終了（exit 0、一回限りのタスクの可能性。"
+                              f"想定どおりなら IGNORE_CONTAINERS に追加）")
             elif st == "created":
-                alerts.append(f"[INFO] {tag} {c['name']} 已创建但从未启动（status=created）")
+                alerts.append(f"[INFO] {tag} {c['name']} は作成済みだが未起動（status=created）")
             elif st == "paused":
-                alerts.append(f"[WARN] {tag} {c['name']} 被暂停（status=paused）")
+                alerts.append(f"[WARN] {tag} {c['name']} が一時停止中（status=paused）")
             else:
                 # exited≠0 / restarting / dead / removing
-                detail = f"，exit {c.get('exit_code')}" if st == "exited" else ""
-                alerts.append(f"[CRIT] {tag} {c['name']} 未运行（status={st}{detail}）")
+                detail = f"、exit {c.get('exit_code')}" if st == "exited" else ""
+                alerts.append(f"[CRIT] {tag} {c['name']} が停止中（status={st}{detail}）")
             continue
         if c["health"] not in ("none", "healthy"):
             alerts.append(f"[WARN] {tag} {c['name']} health={c['health']}")
         if c.get("budget_pct") is not None and c["budget_pct"] >= BUDGET_INFO_PCT:
-            alerts.append(f"[INFO] {tag} {c['name']} 内存 {c['mem_mib']}MiB，已达 Slack 阈值 {c['budget_gib']}GiB 的 "
-                          f"{c['budget_pct']}%（≥95% 持续时 Slack 实时报警）")
-        # 重启只看增量（上次巡检以来），不看无意义的累计次数
+            alerts.append(f"[INFO] {tag} {c['name']} のメモリ {c['mem_mib']}MiB、Slack 閾値 {c['budget_gib']}GiB の "
+                          f"{c['budget_pct']}% に到達（95% 以上が続くと Slack がリアルタイム通知）")
+        # 再起動は増分（前回巡検以降）だけを見る。累計回数は意味がないので見ない
         rd = c.get("restarts_delta")
         if rd:
             lv = "CRIT" if rd >= RESTART_DELTA_CRIT else "WARN"
-            why = "，疑似反复崩溃" if lv == "CRIT" else ""
-            alerts.append(f"[{lv}] {tag} {c['name']} 上次巡检以来重启 {rd} 次（累计 {c['restarts']}{why}）")
+            why = "、クラッシュの繰り返しの疑い" if lv == "CRIT" else ""
+            alerts.append(f"[{lv}] {tag} {c['name']} が前回巡検以降 {rd} 回再起動（累計 {c['restarts']}{why}）")
             continue
         if c.get("restarted_since_last"):
-            alerts.append(f"[INFO] {tag} {c['name']} 上次巡检以来被重新启动（RestartCount 未增加 → 非崩溃自愈，"
-                          f"而是手动 restart / compose 重建 / 定时任务；启动于 {c['started_at'][:16]}Z）")
+            alerts.append(f"[INFO] {tag} {c['name']} が前回巡検以降に再起動された（RestartCount は増えていない → クラッシュによる自動再起動ではなく、"
+                          f"手動 restart / compose 再作成 / 定期ジョブ。起動 {c['started_at'][:16]}Z）")
             continue
-        # 无增量数据（首次运行等）时，退而标「最近重启过」
+        # 増分データがない（初回実行等）場合は「最近再起動した」で代替
         ud = c.get("uptime_days")
         if rd is None and isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS:
-            alerts.append(f"[INFO] {tag} {c['name']} 最近重启过（uptime {ud} 天，累计 {c['restarts']} 次）")
+            alerts.append(f"[INFO] {tag} {c['name']} は最近再起動した（uptime {ud} 日、累計 {c['restarts']} 回）")
 
     for w in web:
         if not w.get("ok"):
             detail = w.get("error") or f"HTTP {w.get('status')}"
-            alerts.append(f"[CRIT] 网页 {w['name']} 探活失败：{detail}")
+            alerts.append(f"[CRIT] Web {w['name']} の疎通失敗：{detail}")
         elif isinstance(w.get("latency_ms"), int) and w["latency_ms"] >= WEB_LATENCY_WARN_MS:
-            alerts.append(f"[WARN] 网页 {w['name']} 响应过慢：{w['latency_ms']}ms（≥{WEB_LATENCY_WARN_MS}ms，疑似依赖变慢）")
+            alerts.append(f"[WARN] Web {w['name']} の応答が遅い：{w['latency_ms']}ms（≥{WEB_LATENCY_WARN_MS}ms、依存先の遅延の疑い）")
 
     for n in nginx or []:
         if n.get("error"):
-            alerts.append(f"[INFO] nginx 日志 {n['container']} 未取得：{n['error']}")
+            alerts.append(f"[INFO] nginx ログ {n['container']} を取得できない：{n['error']}")
         elif n.get("5xx"):
             lv = "WARN" if n["5xx"] >= NGINX_5XX_WARN_MIN and n["5xx_pct"] >= NGINX_5XX_WARN_PCT else "INFO"
             codes = ", ".join(f"{k}×{v}" for k, v in sorted(n["by_code"].items()))
-            alerts.append(f"[{lv}] nginx {n['container']} 近 {n['window_h']}h 5xx {n['5xx']} 件 / {n['requests']} 请求"
+            alerts.append(f"[{lv}] nginx {n['container']} 直近 {n['window_h']}h で 5xx {n['5xx']} 件 / {n['requests']} リクエスト"
                           f"（{n['5xx_pct']}%：{codes}）")
 
     if cw is not None:
         if cw.get("error"):
-            # 数据源缺失不等于平台有问题，本机信号仍完整 → INFO，不影响总合状态
-            alerts.append(f"[INFO] CloudWatch 未取得：{cw['error']}")
+            # データソースが欠けてもプラットフォームの異常ではなく、ローカル信号は揃っている → INFO（総合ステータスに影響しない）
+            alerts.append(f"[INFO] CloudWatch を取得できない：{cw['error']}")
         m = cw.get("metrics", {})
         sf = m.get("status_failed", {}).get("1h", {})
         if sf.get("max", 0) >= 1:
-            alerts.append("[CRIT] CloudWatch：近 1h EC2 状态检查失败（StatusCheckFailed=1，AWS 侧硬件/网络或实例 OS 异常）")
+            alerts.append("[CRIT] CloudWatch：直近 1h に EC2 状態チェック失敗（StatusCheckFailed=1、AWS 側のハードウェア/ネットワークまたはインスタンス OS の異常）")
         cpu = m.get("cpu", {}).get("1h", {})
         if cpu.get("avg", 0) >= CW_CPU_WARN:
-            alerts.append(f"[WARN] CloudWatch：近 1h CPU 平均 {cpu['avg']}% ≥ {CW_CPU_WARN}%（峰值 {m.get('cpu_peak', {}).get('1h', {}).get('max')}%）")
-        for key, label in (("ebs_io_balance", "EBS IO 突发余额"), ("ebs_byte_balance", "EBS 吞吐突发余额")):
+            alerts.append(f"[WARN] CloudWatch：直近 1h の CPU 平均 {cpu['avg']}% ≥ {CW_CPU_WARN}%（ピーク {m.get('cpu_peak', {}).get('1h', {}).get('max')}%）")
+        for key, label in (("ebs_io_balance", "EBS IO バースト残高"), ("ebs_byte_balance", "EBS スループットバースト残高")):
             b = m.get(key)
             if b and b["latest"] <= CW_BALANCE_WARN:
-                alerts.append(f"[WARN] CloudWatch：{label} {b['latest']}% ≤ {CW_BALANCE_WARN}%（耗尽后磁盘 IO 被限速，"
+                alerts.append(f"[WARN] CloudWatch：{label} {b['latest']}% ≤ {CW_BALANCE_WARN}%（枯渇するとディスク IO が制限される。"
                               f"24h 最低 {b.get('24h', {}).get('min')}%）")
         cc = m.get("cpu_credit")
         if cc and cc["latest"] <= CW_CPU_CREDIT_WARN:
-            alerts.append(f"[WARN] CloudWatch：CPU credit 余额 {cc['latest']} ≤ {CW_CPU_CREDIT_WARN}（耗尽后 CPU 被限速到基准性能）")
+            alerts.append(f"[WARN] CloudWatch：CPU クレジット残高 {cc['latest']} ≤ {CW_CPU_CREDIT_WARN}（枯渇すると CPU がベースライン性能に制限される）")
         for a in cw.get("alarms", []):
             if a["state"] == "ALARM":
-                alerts.append(f"[WARN] CloudWatch 告警 {a['name']} 处于 ALARM（{a['metric']} 阈值 {a['threshold']}）")
+                alerts.append(f"[WARN] CloudWatch アラーム {a['name']} が ALARM 状態（{a['metric']} 閾値 {a['threshold']}）")
 
     return alerts
 
 
 # ----------------------------------------------------------------------------
-# 构建「真正发给 AI 的精简 payload」——本地存全量快照，但只把必要内容喂给 LLM 省 token
+# 「実際に AI に送る軽量 payload」の構築。ローカルには全量スナップショットを保存し、LLM には必要な部分だけ送って token を節約する
 # ----------------------------------------------------------------------------
 def build_ai_payload(snapshot):
     conts = [c for c in snapshot["containers"] if not c.get("ignored")]
     n_ignored = len(snapshot["containers"]) - len(conts)
 
     def is_nominal(c):
-        # 累计重启次数不参与判定（长期累积是常态、属噪音）；只看当前状态与「最近重启」
+        # 累計再起動回数は判定に使わない（長期間で積み上がるのは普通でノイズ）。現在の状態と「最近の再起動」だけを見る
         ud = c.get("uptime_days")
         recent = isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS
         return (c["status"] == "running" and c["health"] in ("healthy", "none")
                 and not c.get("oom_killed") and not recent and not c.get("restarts_delta")
                 and not c.get("restarted_since_last"))
 
-    # notable = 有非常态特征的容器（未运行/不健康/OOM/最近重启/上次巡检以来有新重启）
+    # notable = 通常と異なる特徴を持つコンテナ（停止 / unhealthy / OOM / 最近の再起動 / 前回巡検以降の再起動）
     notable = []
     for c in conts:
         if not is_nominal(c):
@@ -906,13 +908,13 @@ def build_ai_payload(snapshot):
                 "swap_mib": c.get("swap_mib"),
             })
 
-    # 内存占用前 N 名（无论是否异常都发），让 AI 能把内存/swap 问题落到具体容器
+    # メモリ使用量上位 N（異常の有無に関係なく送る）。AI がメモリ/swap の問題を具体的なコンテナに結び付けられるように
     top_mem = sorted((c for c in conts if isinstance(c.get("mem_mib"), int)),
                      key=lambda c: c["mem_mib"], reverse=True)[:TOP_MEM_N]
     top_memory = [{k: c.get(k) for k in ("name", "mem_mib", "swap_mib", "budget_gib", "budget_pct")}
                   for c in top_mem]
     top_swap = sorted((c for c in conts if c.get("swap_mib")), key=lambda c: c["swap_mib"], reverse=True)[:TOP_MEM_N]
-    # slack_alert.sh 盯着的容器：用量相对其阈值的余量（无论是否在前 N 名都发）
+    # slack_alert.sh が監視しているコンテナ：閾値に対する余裕（上位 N に入っていなくても送る）
     budgets = [{k: c.get(k) for k in ("name", "mem_mib", "budget_gib", "budget_pct")}
                for c in conts if c.get("budget_gib")]
 
@@ -925,7 +927,7 @@ def build_ai_payload(snapshot):
             "summary": {"total": total, "running": running,
                         "not_running": total - running, "nominal": total - len(notable),
                         "ignored": n_ignored},
-            "notable": notable,   # 只发值得看的容器，正常的只给计数
+            "notable": notable,   # 注目すべきコンテナだけ送り、正常なものは件数のみ
             "top_memory": top_memory,
             "top_swap": [{"name": c["name"], "swap_mib": c["swap_mib"]} for c in top_swap],
             "slack_mem_budgets": budgets,
@@ -933,24 +935,26 @@ def build_ai_payload(snapshot):
         "web": snapshot["web"],
         "cloudwatch": snapshot.get("cloudwatch"),
         "nginx": snapshot.get("nginx"),
-        "flags": snapshot["alerts"],   # 确定性关注提示
+        "flags": snapshot["alerts"],   # 決定的な注目ポイント
         "rule_status": _overall(snapshot["alerts"]),
-        "note_for_ai": ("flags 是确定性提示，实时告警另由 Slack 负责；正常容器已折叠为计数，IGNORE_CONTAINERS 中的容器已排除。"
-                        "exit 0 退出的容器多为一次性任务。restarts 是累计值（长期累积属常态），restarts_delta 才是"
-                        "上次巡检以来的新增重启。host.swap_io 是换页速率：swap 已用量高但换页速率≈0 表示历史残留，"
-                        "不等于当前内存压力。mem_mib/swap_mib 为各容器 cgroup 实测值（MiB），容量单位均为二进制（GiB/MiB）。"
-                        "slack_mem_budgets 是现有实时告警 slack_alert.sh 为部分容器设的内存阈值（GiB）及当前占比，"
-                        "≥95% 持续 15 分钟时 Slack 会实时报警。"
-                        "nginx 是反向代理访问日志的统计（窗口内请求数、5xx 数与比例、按状态码/路径分布）。"
-                        "restarted_since_last=true 且 restarts_delta=0 表示非崩溃的重启（手动/重建/定时任务）。"
-                        "host.disk_trend 是磁盘增速（GB/天，线性回归）及到达 WARN/CRIT 阈值的预计天数与日期。"
-                        "cloudwatch 是 AWS 侧看到的本 EC2 实例指标（5 分钟粒度，latest 与近 1h/24h 的 avg/min/max，"
-                        "单位见 unit），用于和本机信号交叉印证；cloudwatch 为 null 表示未启用。"),
+        "note_for_ai": ("flags はルールによる決定的な注目ポイント。リアルタイム通知は別途 Slack が担当している。"
+                        "正常なコンテナは件数に集約し、IGNORE_CONTAINERS のコンテナは除外済み。"
+                        "exit 0 で終了したコンテナの多くは一回限りのタスク。restarts は累計値（長期間で積み上がるのは普通）で、"
+                        "restarts_delta が前回巡検以降の再起動増分。host.swap_io は換ページ速度：swap 使用量が多くても"
+                        "換ページ速度が ≈0 なら過去の残留であり、現在のメモリ逼迫ではない。"
+                        "mem_mib/swap_mib は各コンテナの cgroup 実測値（MiB）。容量の単位はすべて二進（GiB/MiB）。"
+                        "slack_mem_budgets は既存のリアルタイム通知 slack_alert.sh が一部コンテナに設定しているメモリ閾値（GiB）"
+                        "と現在の割合で、95% 以上が 15 分続くと Slack がリアルタイム通知する。"
+                        "nginx はリバースプロキシのアクセスログ集計（窓内のリクエスト数、5xx 件数と比率、ステータスコード別/パス別）。"
+                        "restarted_since_last=true かつ restarts_delta=0 はクラッシュ以外の再起動（手動/再作成/定期ジョブ）。"
+                        "host.disk_trend はディスク増加速度（GiB/日、線形回帰）と WARN/CRIT 閾値到達までの見込み日数・日付。"
+                        "cloudwatch は AWS 側から見た本 EC2 インスタンスの指標（5 分粒度、latest と直近 1h/24h の avg/min/max、"
+                        "単位は unit）で、ローカル信号との突き合わせに使う。cloudwatch が null の場合は無効。"),
     }
 
 
 # ----------------------------------------------------------------------------
-# AI 诊断
+# AI 診断
 # ----------------------------------------------------------------------------
 LANG_LABEL = {"ja": "日本語", "zh": "中文", "en": "English"}
 
@@ -982,7 +986,7 @@ RETRY_STATUS = (429, 500, 502, 503, 504)
 
 
 def _post(url, payload, headers, timeout, retries=3, backoff=(5, 20)):
-    """POST JSON，返回响应文本。限流 / 5xx / 网络错误时退避重试，其余错误立即抛出。"""
+    """JSON を POST し、レスポンス本文を返す。レート制限 / 5xx / ネットワークエラーは間隔を空けて再試行し、それ以外は即座に例外。"""
     data = json.dumps(payload).encode("utf-8")
     for attempt in range(retries):
         req = request.Request(url, data=data, headers={"content-type": "application/json", **headers}, method="POST")
@@ -994,11 +998,11 @@ def _post(url, payload, headers, timeout, retries=3, backoff=(5, 20)):
             if e.code not in RETRY_STATUS or attempt == retries - 1:
                 raise RuntimeError(msg) from None
         except (error.URLError, TimeoutError, OSError) as e:
-            msg = f"网络错误：{e}"
+            msg = f"ネットワークエラー：{e}"
             if attempt == retries - 1:
                 raise RuntimeError(msg) from None
         wait = backoff[min(attempt, len(backoff) - 1)]
-        print(f"[warn] {msg} → {wait}s 后重试（{attempt + 2}/{retries}）", file=sys.stderr)
+        print(f"[warn] {msg} → {wait}s 後に再試行（{attempt + 2}/{retries}）", file=sys.stderr)
         time.sleep(wait)
 
 
@@ -1015,14 +1019,14 @@ def _diagnose_gemini(snapshot):
         except RuntimeError as e:
             if i == len(models) - 1:
                 raise
-            print(f"[warn] {model} 失败：{e} → 改用 {models[i + 1]}", file=sys.stderr)
+            print(f"[warn] {model} 失敗：{e} → {models[i + 1]} に切り替え", file=sys.stderr)
 
 
 def _diagnose_gemini_model(snapshot, model):
     payload = {
         "systemInstruction": {"parts": [{"text": _system_prompt()}]},
         "contents": [{"role": "user", "parts": [{"text": _user_content(snapshot)}]}],
-        # 2.5 系的思考 token 也计入 maxOutputTokens，留足余量以免正文被截断
+        # 2.5 系は思考 token も maxOutputTokens に含まれるため、本文が途中で切れないよう余裕を持たせる
         "generationConfig": {"maxOutputTokens": 8192},
     }
     data = _post_json(
@@ -1031,7 +1035,7 @@ def _diagnose_gemini_model(snapshot, model):
     )
     cands = data.get("candidates", [])
     if not cands:
-        raise RuntimeError(f"Gemini 无候选回复：{json.dumps(data, ensure_ascii=False)[:300]}")
+        raise RuntimeError(f"Gemini の応答に候補がない：{json.dumps(data, ensure_ascii=False)[:300]}")
     parts = cands[0].get("content", {}).get("parts", [])
     text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
     if cands[0].get("finishReason") == "MAX_TOKENS":
@@ -1052,17 +1056,17 @@ def _diagnose_anthropic(snapshot):
 
 
 PROVIDERS = {
-    # name: (诊断函数, 所需 key 的变量名, 模型名)
+    # name: (診断関数, 必要な API キーの変数名, モデル名)
     "gemini": (_diagnose_gemini, "GEMINI_API_KEY", GEMINI_MODEL),
     "anthropic": (_diagnose_anthropic, "ANTHROPIC_API_KEY", ANTHROPIC_MODEL),
 }
 
 
 # ----------------------------------------------------------------------------
-# 报告渲染 + 落盘 + 清理
+# レポート生成 + 保存 + 古いファイルの削除
 # ----------------------------------------------------------------------------
 def _overall(alerts):
-    # INFO 不影响总合状态
+    # INFO は総合ステータスに影響しない
     if any(a.startswith("[CRIT]") for a in alerts):
         return "危険"
     return "注意" if any(a.startswith("[WARN]") for a in alerts) else "正常"
@@ -1090,7 +1094,7 @@ def render_markdown(snap, ai_text, generated_at):
     else:
         L.append("- 異常なし")
     L.append("")
-    # 主机
+    # ホスト
     L.append("## ホストリソース")
     L.append("")
     d, m, s, lo = host.get("disk", {}), host.get("mem", {}), host.get("swap", {}), host.get("load", {})
@@ -1106,9 +1110,9 @@ def render_markdown(snap, ai_text, generated_at):
     for key, label in (("now", f"直近 {sio.get('now_window_s')} 秒"), ("since_last", f"前回巡検から {sio.get('since_last_min')} 分")):
         if sio.get(key):
             L.append(f"- swap 換ページ（{label}）: in {sio[key]['in_kbps']} KB/s / out {sio[key]['out_kbps']} KB/s")
-    L.append(f"- load: 1m={lo.get('1m')} 5m={lo.get('5m')} 15m={lo.get('15m')} ({lo.get('cpu_count')} 核, 每核 {lo.get('per_cpu_1m')})")
+    L.append(f"- load: 1m={lo.get('1m')} 5m={lo.get('5m')} 15m={lo.get('15m')} ({lo.get('cpu_count')} コア, コアあたり {lo.get('per_cpu_1m')})")
     L.append("")
-    # 容器
+    # コンテナ
     L.append("## コンテナ状態")
     L.append("")
     L.append("Restarts は累計（括弧内は前回巡検からの増分、— は比較データなし。🔄 = 前回巡検以降に手動/再作成等で再起動）。")
@@ -1128,7 +1132,7 @@ def render_markdown(snap, ai_text, generated_at):
         L.append(f"| {c['name']} | {mark} | {st} | {c['health']} | {_v(c.get('uptime_days'))} | {rs} | "
                  f"{_v(c.get('mem_mib'))}{budget} | {_v(c.get('swap_mib'))} | {'⚠️' if c['oom_killed'] else ''} |")
     L.append("")
-    # 网页
+    # Web
     if web:
         L.append("## Web 可用性")
         L.append("")
@@ -1175,11 +1179,11 @@ def render_markdown(snap, ai_text, generated_at):
             L.append("")
             if cw["alarms"]:
                 for a in cw["alarms"]:
-                    L.append(f"- 告警 {a['name']}: **{a['state']}**（{a['metric']} 閾値 {a['threshold']}）")
+                    L.append(f"- アラーム {a['name']}: **{a['state']}**（{a['metric']} 閾値 {a['threshold']}）")
             else:
-                L.append("- 本インスタンスに紐づく CloudWatch 告警: なし")
+                L.append("- 本インスタンスに紐づく CloudWatch アラーム: なし")
         if cw.get("alarms_error"):
-            L.append(f"- 告警取得失敗: {cw['alarms_error']}")
+            L.append(f"- アラーム取得失敗: {cw['alarms_error']}")
         L.append("")
     return "\n".join(L)
 
@@ -1198,15 +1202,16 @@ def cleanup_old(out_dir, keep_days):
 
 
 # ----------------------------------------------------------------------------
-# Slack 通知：只在状态变化时发。比较对象是上次「已成功通知」的状态（存 state.json），
-# 发送失败则不更新，下次运行会再尝试。INFO 不参与。
+# Slack 通知：状態が変わったときだけ送る。比較対象は前回「通知に成功した」状態（state.json に保存）。
+# 送信に失敗した場合は更新せず、次回の実行で再送する。INFO は対象外。
 # ----------------------------------------------------------------------------
 _COLOR = {"危険": "danger", "注意": "warning", "正常": "good"}
+NOTIFY_STATE_VERSION = 2   # アラート文言を変えたら上げる（旧文言との比較で誤通知しないため）
 _EMOJI = {"危険": ":red_circle:", "注意": ":large_yellow_circle:", "正常": ":white_check_mark:"}
 
 
 def _alert_key(a):
-    # 去掉数字：同一问题只是数值变了（swap 5.7→5.8GiB）不算变化
+    # 数字を除く：同じ問題で数値が変わっただけ（swap 5.7→5.8GiB）は変化とみなさない
     return re.sub(r"\d+(?:\.\d+)?", "#", a)
 
 
@@ -1217,20 +1222,23 @@ def _send_slack(title, text, color, footer):
 
 
 def notify_on_change(alerts, prev_notify, ai_text, generated_at):
-    """返回应写回 state 的 notify 状态。"""
+    """state に書き戻す notify 状態を返す。"""
     overall = _overall(alerts)
     cur = {_alert_key(a): a for a in alerts if a.startswith(("[WARN]", "[CRIT]"))}
     prev_keys = prev_notify.get("keys", {})
     prev_status = prev_notify.get("status", "正常")
+    if prev_notify and prev_notify.get("v") != NOTIFY_STATE_VERSION:
+        # 文言変更前の記録とは個別アラートを比較できない → 総合ステータスの変化だけで判断する
+        prev_keys = {k: cur[k] for k in cur}
     new = [cur[k] for k in cur if k not in prev_keys]
     resolved = [prev_keys[k] for k in prev_keys if k not in cur]
-    new_state = {"status": overall, "keys": cur}
+    new_state = {"v": NOTIFY_STATE_VERSION, "status": overall, "keys": cur}
     if overall == prev_status and not new and not resolved:
-        print("[ok] 状态无变化，不发 Slack")
+        print("[ok] 状態に変化なし、Slack 通知なし")
         return new_state
     if not SLACK_WEBHOOK_URL:
-        print("[warn] 状态有变化，但未设置 SLACK_WEBHOOK_URL，跳过通知", file=sys.stderr)
-        return prev_notify     # 不记为已通知：配置后首次运行会补发
+        print("[warn] 状態は変化したが SLACK_WEBHOOK_URL が未設定のため通知しない", file=sys.stderr)
+        return prev_notify     # 通知済みにしない：設定後の初回実行で送られる
     host = socket.gethostname()
     title = (f"{_EMOJI[overall]} プラットフォーム巡検: {prev_status} → {overall}" if overall != prev_status
              else f"{_EMOJI[overall]} プラットフォーム巡検: {overall}（内容に変化あり）")
@@ -1245,10 +1253,10 @@ def notify_on_change(alerts, prev_notify, ai_text, generated_at):
     try:
         _send_slack(title, "\n\n".join(parts), _COLOR[overall],
                     f"{host} | {generated_at} | 詳細: {os.path.join(OUT_DIR, 'health_latest.md')}")
-        print("[ok] 已发送 Slack 通知")
+        print("[ok] Slack に通知した")
         return new_state
     except RuntimeError as e:
-        print(f"[warn] Slack 通知失败（下次运行重试）：{e}", file=sys.stderr)
+        print(f"[warn] Slack 通知に失敗（次回の実行で再送）：{e}", file=sys.stderr)
         return prev_notify
 
 
@@ -1257,13 +1265,13 @@ def _short_lines(text, n):
 
 
 def _acquire_lock():
-    """防止两次巡检重叠（例如上一次卡在 docker / AI 上）。拿不到锁就直接退出。"""
+    """巡検の重複実行を防ぐ（前回が docker や AI で止まっている場合など）。ロックが取れなければそのまま終了する。"""
     os.makedirs(OUT_DIR, exist_ok=True)
     fh = open(os.path.join(OUT_DIR, ".lock"), "w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print("[warn] 另一次巡检仍在运行，本次跳过", file=sys.stderr)
+        print("[warn] 別の巡検が実行中のため、今回はスキップ", file=sys.stderr)
         sys.exit(0)
     return fh
 
@@ -1272,23 +1280,23 @@ def _acquire_lock():
 # main
 # ----------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Sentry+PostHog 平台健康巡检")
-    ap.add_argument("--dry-run", action="store_true", help="只采集聚合，不调 LLM")
-    ap.add_argument("--stdout", action="store_true", help="报告同时打印到终端")
+    ap = argparse.ArgumentParser(description="Sentry + PostHog プラットフォーム健康巡検")
+    ap.add_argument("--dry-run", action="store_true", help="収集とルール判定のみ（LLM を呼ばない）")
+    ap.add_argument("--stdout", action="store_true", help="レポートを端末にも出力する")
     ap.add_argument("--show-payload", action="store_true",
-                    help="把「原封不动准备发送给 AI 的 JSON」打印到终端（不调 AI）")
-    ap.add_argument("--no-notify", action="store_true", help="不发 Slack 通知（--dry-run 时也不发）")
-    ap.add_argument("--notify-test", action="store_true", help="向 SLACK_WEBHOOK_URL 发一条测试消息后退出")
+                    help="AI に送る JSON をそのまま端末に出力する（AI は呼ばない）")
+    ap.add_argument("--no-notify", action="store_true", help="Slack 通知を送らない（--dry-run 時も送らない）")
+    ap.add_argument("--notify-test", action="store_true", help="SLACK_WEBHOOK_URL にテストメッセージを 1 件送って終了する")
     args = ap.parse_args()
 
     if args.notify_test:
         if not SLACK_WEBHOOK_URL:
-            sys.exit("未设置 SLACK_WEBHOOK_URL")
+            sys.exit("SLACK_WEBHOOK_URL が未設定")
         _send_slack(":test_tube: プラットフォーム巡検: 通知テスト", "platform_health.py からのテスト送信です。",
                     "#439FE0", socket.gethostname())
-        print("[ok] 测试消息已发送")
+        print("[ok] テストメッセージを送信した")
         return
-    _lock = _acquire_lock()  # noqa: F841  进程结束自动释放
+    _lock = _acquire_lock()  # noqa: F841  プロセス終了時に自動で解放される
 
     now = dt.datetime.now(dt.timezone.utc)
     generated_at = now.strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1306,7 +1314,7 @@ def main():
     nginx_window = min(time.time() - prev["ts"], NGINX_MAX_WINDOW_H * 3600) if prev.get("ts") else NGINX_MAX_WINDOW_H * 3600
     nginx = collect_nginx(nginx_window) if not cinfo.get("error") else []
 
-    # swap 换页速率：本次运行期间（至少 3 秒窗口）+ 上次巡检以来的平均
+    # swap 換ページ速度：今回の実行中（最低 3 秒の窓）+ 前回巡検以降の平均
     elapsed = time.time() - t0
     if elapsed < 3:
         time.sleep(3 - elapsed)
@@ -1316,14 +1324,14 @@ def main():
         host["swap_io"]["since_last"] = _swap_rate(prev["vmstat"], vm1, t1 - prev["ts"])
         host["swap_io"]["since_last_min"] = round((t1 - prev["ts"]) / 60)
     if cinfo.get("error"):
-        print(f"[warn] 容器采集失败: {cinfo['error']}", file=sys.stderr)
+        print(f"[warn] コンテナ情報の取得に失敗: {cinfo['error']}", file=sys.stderr)
     cw = collect_cloudwatch()
     alerts = compute_alerts(host, containers, web, cw, nginx)
     if cinfo.get("error"):
-        # 采集不到≠没问题：不能让总合状态显示为 🟢
-        alerts.insert(0, f"[WARN] 容器状态采集失败，本次结果不完整：{cinfo['error']}")
+        # 取得できない ≠ 問題なし：総合ステータスを 🟢 にしてはいけない
+        alerts.insert(0, f"[WARN] コンテナ状態の取得に失敗、今回の結果は不完全：{cinfo['error']}")
     elif cinfo.get("partial"):
-        alerts.insert(0, f"[WARN] 部分容器状态采集失败：{cinfo['partial']}")
+        alerts.insert(0, f"[WARN] 一部コンテナの状態取得に失敗：{cinfo['partial']}")
 
     snapshot = {
         "generated_at": generated_at,
@@ -1338,25 +1346,25 @@ def main():
 
     ai_payload = build_ai_payload(snapshot)
 
-    # 打印「准备发给 AI 的 payload」并直接结束（--show-payload 隐含不调 AI）
+    # AI に送る payload を出力して終了（--show-payload は AI を呼ばない）
     if args.show_payload:
-        print("===== 以下 JSON 就是准备发送给 AI 的内容（--show-payload，已精简）=====")
+        print("===== 以下が AI に送る JSON（--show-payload、軽量化済み）=====")
         print(json.dumps(ai_payload, ensure_ascii=False, indent=2))
-        print("===== 结束（未调用 AI，未写文件；完整快照见 out/health_*.json）=====")
+        print("===== 終了（AI 呼び出し・ファイル書き込みなし。全量スナップショットは out/health_*.json）=====")
         return
 
     ai_text = ""
     if not args.dry_run:
         prov = PROVIDERS.get(AI_PROVIDER)
         if prov is None:
-            print(f"[warn] 未知 AI_PROVIDER={AI_PROVIDER}（可选 {'/'.join(PROVIDERS)}），跳过 AI 诊断", file=sys.stderr)
+            print(f"[warn] 不明な AI_PROVIDER={AI_PROVIDER}（選択肢 {'/'.join(PROVIDERS)}）、AI 診断をスキップ", file=sys.stderr)
         elif not globals()[prov[1]]:
-            print(f"[warn] 未设置 {prov[1]}，跳过 AI 诊断（等同 --dry-run）", file=sys.stderr)
+            print(f"[warn] {prov[1]} が未設定のため AI 診断をスキップ（--dry-run と同じ）", file=sys.stderr)
         else:
             try:
                 ai_text = prov[0](ai_payload)
             except Exception as e:  # noqa
-                print(f"[warn] AI 诊断失败: {e}", file=sys.stderr)
+                print(f"[warn] AI 診断に失敗: {e}", file=sys.stderr)
 
     md = render_markdown(snapshot, ai_text, generated_at)
 

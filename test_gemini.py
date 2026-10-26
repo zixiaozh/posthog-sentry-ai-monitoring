@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-test_gemini.py — 独立验证「能否正常调用 Gemini API 对话」。零依赖，仅标准库（走 REST）。
+test_gemini.py — Gemini API と正常に対話できるかを単独で確認する。依存なし、標準ライブラリのみ（REST を直接呼ぶ）。
 
-对应你贴的 SDK 写法：
+SDK での書き方との対応：
   - send_message(history_context, question)  ≈ model.start_chat(history=[...]).send_message(question)
   - generate_tag(user_input, model_reply)    ≈ model.generate_content(prompt)
-不用 pip install google-generativeai，直接标准库调 REST，更适合资源受限的 EC2。
+pip install google-generativeai は不要。標準ライブラリで REST を呼ぶので、リソースの少ない EC2 に向いている。
 
-API key：在 https://aistudio.google.com/app/apikey 生成（有免费额度）。
+API キー：https://aistudio.google.com/app/apikey で発行（無料枠あり）。
 
-用法：
+使い方：
   GEMINI_API_KEY=AIza... python3 test_gemini.py
-  # 或写进同目录 .env（GEMINI_API_KEY=AIza...），直接：
+  # または同じディレクトリの .env に書いておけば（GEMINI_API_KEY=AIza...）そのまま：
   python3 test_gemini.py
-  # 自定义问一句：
-  python3 test_gemini.py "用一句话解释什么是 SRE"
+  # 任意の質問を送る：
+  python3 test_gemini.py "SRE とは何かを一文で説明して"
 """
 
 import os
@@ -23,7 +23,7 @@ import sys
 import json
 from urllib import request, error
 
-# --- 自动加载同目录 .env（与其它脚本一致）---
+# --- 同じディレクトリの .env を自動で読み込む（他のスクリプトと同じ）---
 def _load_dotenv():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     try:
@@ -47,7 +47,7 @@ BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def _call(contents):
-    """底层：给 generateContent 发 contents 数组，返回 (text, usage)。"""
+    """内部用：generateContent に contents 配列を送り、(text, usage) を返す。"""
     url = f"{BASE}/models/{MODEL}:generateContent"
     payload = {"contents": contents}
     req = request.Request(
@@ -60,14 +60,14 @@ def _call(contents):
         data = json.loads(resp.read().decode("utf-8"))
     cands = data.get("candidates", [])
     if not cands:
-        raise RuntimeError(f"无候选回复（可能被安全策略拦截）：{json.dumps(data, ensure_ascii=False)[:300]}")
+        raise RuntimeError(f"応答に候補がない（安全フィルタでブロックされた可能性）：{json.dumps(data, ensure_ascii=False)[:300]}")
     parts = cands[0].get("content", {}).get("parts", [])
     text = "".join(p.get("text", "") for p in parts).strip()
     return text, data.get("usageMetadata", {})
 
 
 def send_message(history_context: str, question: str):
-    """带前置上下文的对话（等价 start_chat(history=[user:history_context]).send_message(question)）。"""
+    """前提コンテキスト付きの対話（start_chat(history=[user:history_context]).send_message(question) 相当）。"""
     contents = [
         {"role": "user", "parts": [{"text": history_context}]},
         {"role": "user", "parts": [{"text": question}]},
@@ -76,7 +76,7 @@ def send_message(history_context: str, question: str):
 
 
 def generate_tag(user_input: str, model_reply: str):
-    """给一段对话生成简短标签（等价你贴的 generate_tag）。"""
+    """会話に短いタグを付ける（generate_tag 相当）。"""
     prompt = (
         "下の会話を要約して、短いタグを生成してください。\n"
         f"ユーザーの質問: {user_input}\n"
@@ -89,39 +89,39 @@ def generate_tag(user_input: str, model_reply: str):
 
 def main():
     if not API_KEY:
-        sys.exit("ERROR: 未设置 GEMINI_API_KEY（可临时传或写进 .env）")
+        sys.exit("ERROR: GEMINI_API_KEY が未設定（環境変数で渡すか .env に書く）")
 
-    question = sys.argv[1] if len(sys.argv) > 1 else "请用一句话回复，确认你能正常收到我的消息。"
+    question = sys.argv[1] if len(sys.argv) > 1 else "このメッセージを受け取れたことを一文で返してください。"
     history_context = "あなたは運用監視のアシスタントです。簡潔に答えてください。"
 
-    print(f"[..] 使用模型 {MODEL} 发送测试消息…")
-    print(f"[..] 提问：{question}\n")
+    print(f"[..] モデル {MODEL} にテストメッセージを送信中…")
+    print(f"[..] 質問：{question}\n")
     try:
         reply, usage = send_message(history_context, question)
     except error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")
         hint = {
-            400: "→ 常见于 API key 无效（API_KEY_INVALID）或请求格式错，去 aistudio.google.com 核对 key。",
-            403: "→ 无权限/key 受限；确认 key 未被限制或所属项目已启用 Generative Language API。",
-            404: "→ 模型名不对；确认 GEMINI_MODEL（如 gemini-2.5-pro / gemini-2.5-flash）。",
-            429: "→ 触发限流/配额用尽，稍后再试或换模型。",
+            400: "→ API キーが無効（API_KEY_INVALID）かリクエスト形式の誤りが多い。aistudio.google.com でキーを確認する。",
+            403: "→ 権限なし / キーが制限されている。キーの制限と、プロジェクトで Generative Language API が有効かを確認する。",
+            404: "→ モデル名が誤っている。GEMINI_MODEL を確認する（例：gemini-2.5-pro / gemini-2.5-flash）。",
+            429: "→ レート制限 / クォータ超過。時間を置くかモデルを変える。",
         }.get(e.code, "")
-        sys.exit(f"[X] HTTP {e.code} {e.reason} {hint}\n返回体：{body}")
+        sys.exit(f"[X] HTTP {e.code} {e.reason} {hint}\nレスポンス本文：{body}")
     except Exception as e:  # noqa
-        sys.exit(f"[X] 请求失败（网络/出站问题？）：{e}")
+        sys.exit(f"[X] リクエスト失敗（ネットワーク / 外向き通信の問題？）：{e}")
 
-    print("[OK] Gemini 回复：")
+    print("[OK] Gemini の応答：")
     print("  " + reply.replace("\n", "\n  "))
-    print(f"\n[OK] token 用量：输入 {usage.get('promptTokenCount')} / 输出 {usage.get('candidatesTokenCount')}")
+    print(f"\n[OK] token 使用量：入力 {usage.get('promptTokenCount')} / 出力 {usage.get('candidatesTokenCount')}")
 
-    # 顺带演示 generate_tag
+    # ついでに generate_tag を試す
     try:
         tag = generate_tag(question, reply)
-        print(f"[OK] 生成标签演示：{tag}")
+        print(f"[OK] タグ生成：{tag}")
     except Exception as e:  # noqa
-        print(f"[warn] 标签生成失败（不影响主测试）：{e}")
+        print(f"[warn] タグ生成に失敗（メインのテストには影響なし）：{e}")
 
-    print("\n说明能正常对话，GEMINI_API_KEY、网络出站都没问题。")
+    print("\n正常に対話できた。GEMINI_API_KEY と外向き通信に問題なし。")
 
 
 if __name__ == "__main__":
