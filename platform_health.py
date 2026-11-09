@@ -75,6 +75,15 @@ WATCH_PREFIXES = os.environ.get(
 ).split(",")
 # 判定から完全に除外するコンテナ（カンマ区切り、名前に含まれていれば一致）。既知の一回限り・廃止済みコンテナ用
 IGNORE_CONTAINERS = [p.strip() for p in os.environ.get("IGNORE_CONTAINERS", "").split(",") if p.strip()]
+# cron 等で定期的に restart される既知のコンテナ（名前に含まれていれば一致）。クラッシュ以外の再起動を正常扱いにする
+# 既定：root の crontab で 2 日ごと 04:00 に `docker-compose restart snuba-api` が実行されている
+SCHEDULED_RESTARTS = [p.strip() for p in (os.environ.get("SCHEDULED_RESTARTS") or "-snuba-api-").split(",") if p.strip()]
+
+
+def _scheduled_restart(c):
+    """既知の定期再起動によるもの（RestartCount は増えていない）なら True。"""
+    return (any(p in c["name"] for p in SCHEDULED_RESTARTS) and not c.get("restarts_delta")
+            and c.get("status") == "running")
 
 # Web 疎通の対象：「名前=URL」をカンマ区切りで。空なら Web チェックなし。
 # SENTRY_URL / POSTHOG_URL を個別に指定してもよい
@@ -823,13 +832,15 @@ def compute_alerts(host, containers, web, cw=None, nginx=None):
             why = "、クラッシュの繰り返しの疑い" if lv == "CRIT" else ""
             alerts.append(f"[{lv}] {tag} {c['name']} が前回巡検以降 {rd} 回再起動（累計 {c['restarts']}{why}）")
             continue
+        if c.get("restarted_since_last") and _scheduled_restart(c):
+            continue    # 既知の定期再起動（SCHEDULED_RESTARTS）。異常ではない
         if c.get("restarted_since_last"):
             alerts.append(f"[INFO] {tag} {c['name']} が前回巡検以降に再起動された（RestartCount は増えていない → クラッシュによる自動再起動ではなく、"
                           f"手動 restart / compose 再作成 / 定期ジョブ。起動 {c['started_at'][:16]}Z）")
             continue
         # 増分データがない（初回実行等）場合は「最近再起動した」で代替
         ud = c.get("uptime_days")
-        if rd is None and isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS:
+        if rd is None and isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS and not _scheduled_restart(c):
             alerts.append(f"[INFO] {tag} {c['name']} は最近再起動した（uptime {ud} 日、累計 {c['restarts']} 回）")
 
     for w in web:
@@ -885,6 +896,9 @@ def build_ai_payload(snapshot):
         # 累計再起動回数は判定に使わない（長期間で積み上がるのは普通でノイズ）。現在の状態と「最近の再起動」だけを見る
         ud = c.get("uptime_days")
         recent = isinstance(ud, (int, float)) and ud < RECENT_RESTART_DAYS
+        if _scheduled_restart(c):
+            recent = False
+            c = {**c, "restarted_since_last": False}
         return (c["status"] == "running" and c["health"] in ("healthy", "none")
                 and not c.get("oom_killed") and not recent and not c.get("restarts_delta")
                 and not c.get("restarted_since_last"))

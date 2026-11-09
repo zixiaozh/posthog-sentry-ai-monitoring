@@ -143,6 +143,7 @@
 | 起動時刻が変わったが RestartCount は増えていない（手動 restart / 再作成 / 定期ジョブ） | INFO |
 | 増分データなし（初回 / 再作成）かつ `uptime_days` < `RECENT_RESTART_DAYS`（1） | INFO |
 | メモリが Slack 閾値の `BUDGET_INFO_PCT`（80%）以上 | INFO |
+| 名前が `SCHEDULED_RESTARTS` に一致し、RestartCount が増えていない再起動（既知の定期 restart） | 判定しない（正常扱い。クラッシュによる再起動は通常どおり WARN/CRIT） |
 | 名前が `IGNORE_CONTAINERS` に一致 | 判定しない・AI に送らない |
 | docker 自体の取得失敗（権限等） | WARN（誤って 🟢 にしないため） |
 | 一部コンテナの inspect 失敗（取得中に削除された等） | WARN（他のコンテナは通常どおり判定） |
@@ -267,7 +268,7 @@ root の crontab（`sudo crontab -e`）に登録する。`systemd-run` で**本�
 0 0 * * * cd /path/to/posthog-sentry-ai-monitoring && systemd-run --scope --quiet -p MemoryMax=256M -p CPUQuota=50\% nice -n 10 ionice -c3 python3 platform_health.py >> out/cron.log 2>&1
 ```
 
-（UTC 0 時 = JST 9 時。crond がない場合は systemd timer を使う。）
+（UTC 0 時 = JST 9 時。既存の root cron ジョブ（03:00 certbot / symbolicator cleanup、04:00 snuba-api restart）と時間帯をずらしている。crond がない場合は systemd timer を使う。）
 
 ### 主な環境変数
 
@@ -277,6 +278,7 @@ root の crontab（`sudo crontab -e`）に登録する。`systemd-run` で**本�
 | WEB_LATENCY_WARN_MS | 5000 | 応答遅延の閾値 |
 | WATCH_PREFIXES | -web-,-nginx-,-relay-,-postgres-,-db-,-pgbouncer-,-kafka-,-clickhouse-,-redis,-snuba-api-,-taskworker-,-capture-,-ingestion- | コアコンテナ（名前に含まれていれば一致） |
 | IGNORE_CONTAINERS | 空 | 判定から除外するコンテナ |
+| SCHEDULED_RESTARTS | -snuba-api- | cron 等で定期 restart される既知のコンテナ（root の crontab で 2 日ごと 04:00 に snuba-api を restart） |
 | DISK_WARN / DISK_CRIT | 85 / 95 | ディスク使用率 % |
 | MEM_AVAIL_WARN_GB / _CRIT_GB | 2 / 1 | 空きメモリ GiB（< で判定、Slack と同じ） |
 | SWAP_WARN_GB / _CRIT_GB | 8 / 10 | swap 使用量 GiB（Slack と同じ） |
