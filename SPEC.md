@@ -5,7 +5,7 @@
 
 - 対象：`platform_health.py`（外部依存なし。Python 標準ライブラリ + aws CLI）
 - 位置づけ：**1 日 1 回の診断と予測 + AI による原因分析**。リアルタイム通知の `slack_alert.sh` / `slack_alert_http.sh` を補完し、役割は重複させない
-- データソース：ローカル（docker / /proc / nginx ログ / HTTP 疎通）+ CloudWatch。Sentry / PostHog へのログインや API token は不要
+- データソース：ローカル（docker / /proc / nginx ログ / HTTP 疎通 / Sentry の ClickHouse 取り込み件数）+ CloudWatch。Sentry / PostHog へのログインや API token は不要
 
 ---
 
@@ -82,7 +82,16 @@
 リクエスト数、5xx の件数と比率、ステータスコード別件数、5xx の多いパス上位 5 を集計する。ストリームで数えるためメモリ使用は一定、最長 60 秒。
 パスは**クエリを除去**（Sentry の送信 URL には `sentry_key` が含まれる）し、数字部分は `{n}` に正規化する。
 
+`docker logs` が失敗した場合（json-file ログへの NUL 混入等）は、`docker inspect` の `LogPath` を**直接末尾から**窓の分だけ読み、壊れた行は飛ばして集計する。
+この場合は WARN を出す（`docker logs` に依存する `slack_alert_http.sh` は失敗を `|| true` で握りつぶし、5xx = 0 件として**黙って止まる**ため）。
+
 > `slack_alert_http.sh` との違い：あちらは 5 分ごとに 5xx が 1 件でもあれば即通知。こちらは 1 日分の**比率と分布**を見て、異常かどうかを AI に判断させる。
+
+### 2.6b Sentry 取り込み量（ClickHouse `errors_local`）
+
+`docker exec <SENTRY_CLICKHOUSE> clickhouse-client` で直近 8 日 + 当日のエラーイベント数を UTC 日別に数える。
+**昨日**の件数を**直近 7 日（昨日より前）の中央値**と比べる。「Web は 200 を返すがイベントが入ってこない」状態を検出するためで、ヘルス端点や nginx ログでは分からない。
+イベントの中身は読まない（件数のみ）。
 
 ### 2.7 CloudWatch（`aws cloudwatch get-metric-data` / `describe-alarms`）
 
@@ -159,6 +168,10 @@
 | 応答 ≥ `WEB_LATENCY_WARN_MS`（5000ms） | WARN |
 | nginx 5xx ≥ `NGINX_5XX_WARN_MIN`（20）件 かつ ≥ `NGINX_5XX_WARN_PCT`（1%） | WARN |
 | 上記未満で 5xx あり / nginx ログが取れない | INFO |
+| 窓 ≥ `NGINX_SILENT_MIN_H`（1h）でアクセスログ 0 件（ログ欠落 or 通信が届いていない） | WARN |
+| `docker logs` が失敗し、ログファイル直接読み取りに切り替えた | WARN |
+| Sentry 取り込み：昨日 0 件（中央値 > 0） / 中央値の `INGEST_DROP_PCT`（10%）未満 | WARN |
+| Sentry 取り込み量を取得できない | INFO |
 
 ### 3.4 CloudWatch
 
@@ -294,6 +307,9 @@ root の crontab（`sudo crontab -e`）に登録する。`systemd-run` で**本�
 | NGINX_CONTAINERS | sentry-self-hosted-nginx-1 | 5xx を集計する nginx コンテナ |
 | NGINX_MAX_WINDOW_H | 24 | 集計窓の上限（時間） |
 | NGINX_5XX_WARN_PCT / _MIN | 1 / 20 | 5xx 比率 % かつ件数 → WARN |
+| NGINX_SILENT_MIN_H | 1 | 窓がこの時間以上でアクセスログ 0 件 → WARN |
+| SENTRY_CLICKHOUSE | sentry-self-hosted-clickhouse-1 | Sentry の ClickHouse コンテナ（`0` = 取り込み量を見ない） |
+| INGEST_DROP_PCT | 10 | 昨日の取り込み数 < 直近 7 日中央値の N% → WARN |
 | CLOUDWATCH | 1 | 0 = CloudWatch を参照しない |
 | CW_INSTANCE_ID / AWS_REGION | 空（IMDS から取得） | インスタンス ID / リージョンの上書き |
 | CW_CPU_WARN / CW_BALANCE_WARN / CW_CPU_CREDIT_WARN | 80 / 20 / 10 | CloudWatch の閾値 |

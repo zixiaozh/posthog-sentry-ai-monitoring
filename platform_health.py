@@ -135,6 +135,12 @@ NGINX_MAX_WINDOW_H = float(os.environ.get("NGINX_MAX_WINDOW_H", "24"))
 NGINX_5XX_WARN_PCT = float(os.environ.get("NGINX_5XX_WARN_PCT", "1"))    # 5xx 比率 ≥ N% かつ
 NGINX_5XX_WARN_MIN = int(os.environ.get("NGINX_5XX_WARN_MIN", "20"))     # 件数 ≥ N → WARN。それ以外で 5xx があれば INFO
 
+NGINX_SILENT_MIN_H = float(os.environ.get("NGINX_SILENT_MIN_H", "1"))   # 窓 ≥ N 時間でアクセスログ 0 件 → WARN（ログ欠落 or 流入停止）
+
+# Sentry の取り込み量：ClickHouse の errors_local を日別に数え、昨日を直近 7 日の中央値と比べる
+SENTRY_CLICKHOUSE = os.environ.get("SENTRY_CLICKHOUSE", "sentry-self-hosted-clickhouse-1")   # "0" = 無効
+INGEST_DROP_PCT = float(os.environ.get("INGEST_DROP_PCT", "10"))   # 昨日 < 中央値の N% → WARN（0 件も WARN）
+
 # Slack 通知：状態が変わったときだけ送る（WARN/CRIT の新規・解消、総合ステータスの変化）。空なら送らない
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
@@ -686,6 +692,37 @@ def collect_nginx(window_s):
 
 
 # ----------------------------------------------------------------------------
+# 3c) Sentry の取り込み量：「Web は 200 を返すがイベントが入ってこない」を検出する
+#     nginx のログやヘルス端点では分からない（実例：2026-11 に nginx ログが 5 日欠落したが取り込みは継続していた）
+# ----------------------------------------------------------------------------
+def collect_sentry_ingest():
+    if not SENTRY_CLICKHOUSE or SENTRY_CLICKHOUSE == "0":
+        return None
+    q = ("SELECT toDate(timestamp) AS d, count() FROM errors_local "
+         "WHERE timestamp >= today() - 8 GROUP BY d ORDER BY d FORMAT TSV")
+    try:
+        r = subprocess.run(["docker", "exec", SENTRY_CLICKHOUSE, "clickhouse-client", "-q", q],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f"clickhouse-client exit {r.returncode}: {(r.stderr or r.stdout).strip()}")
+        by_day = {}
+        for line in r.stdout.splitlines():
+            d, n = line.split("\t")
+            by_day[d] = int(n)
+    except Exception as e:  # noqa
+        return {"error": _short(str(e))}
+    today = dt.datetime.now(dt.timezone.utc).date()
+    days = [(today - dt.timedelta(days=i)).isoformat() for i in range(8, 0, -1)]   # 8 日前〜昨日（完結した日だけ）
+    counts = [by_day.get(d, 0) for d in days]
+    yesterday, base = counts[-1], sorted(counts[:-1])
+    median = base[len(base) // 2] if base else 0
+    return {"by_day": {d: by_day.get(d, 0) for d in days + [today.isoformat()]},
+            "yesterday": yesterday, "baseline_median_7d": median,
+            "ratio_pct": round(yesterday * 100 / median, 1) if median else None,
+            "note": "当日分は途中までの件数"}
+
+
+# ----------------------------------------------------------------------------
 # 4) CloudWatch：AWS 側から見た EC2 インスタンス指標 + 本インスタンスに紐づく CloudWatch アラーム
 #    aws CLI（Amazon Linux に標準搭載）経由で呼び、外部 Python 依存を増やさない。
 #    ローカル信号は「コンテナ/プロセスの内側」、CloudWatch は「インスタンスの外側」（ネットワーク、EBS 制限、状態チェック、CPU クレジット）を見る。
@@ -824,7 +861,7 @@ def collect_cloudwatch():
 # 「注目ポイント」の算出（決定的なルール。AI の分析の焦点に使う。★リアルタイム通知は slack_alert.sh の担当）
 # 本当に意味のある信号だけを拾い、Slack との重複や累計再起動回数のようなノイズを避ける。
 # ----------------------------------------------------------------------------
-def compute_alerts(host, containers, web, cw=None, nginx=None):
+def compute_alerts(host, containers, web, cw=None, nginx=None, ingest=None):
     alerts = []
 
     d = host.get("disk", {})
@@ -931,6 +968,9 @@ def compute_alerts(host, containers, web, cw=None, nginx=None):
             alerts.append(f"[WARN] nginx {n['container']} の docker logs が失敗（{n['docker_logs_error']}）。"
                           f"ログファイル破損の疑いで、docker logs に依存する slack_alert_http.sh の 5xx 監視も機能していない可能性"
                           f"（本スクリプトはログファイルを直接読んで集計）")
+        if not n.get("error") and n.get("requests") == 0 and n["window_h"] >= NGINX_SILENT_MIN_H:
+            alerts.append(f"[WARN] nginx {n['container']} 直近 {n['window_h']}h のアクセスログが 0 件"
+                          f"（ログの欠落、または通信が届いていない。Sentry の取り込み量と合わせて確認）")
         if n.get("error"):
             alerts.append(f"[INFO] nginx ログ {n['container']} を取得できない：{n['error']}")
         elif n.get("5xx"):
@@ -938,6 +978,15 @@ def compute_alerts(host, containers, web, cw=None, nginx=None):
             codes = ", ".join(f"{k}×{v}" for k, v in sorted(n["by_code"].items()))
             alerts.append(f"[{lv}] nginx {n['container']} 直近 {n['window_h']}h で 5xx {n['5xx']} 件 / {n['requests']} リクエスト"
                           f"（{n['5xx_pct']}%：{codes}）")
+
+    if ingest:
+        if ingest.get("error"):
+            alerts.append(f"[INFO] Sentry 取り込み量を取得できない：{ingest['error']}")
+        elif ingest["yesterday"] == 0 and ingest["baseline_median_7d"] > 0:
+            alerts.append(f"[WARN] Sentry の取り込みイベントが昨日 0 件（直近 7 日の中央値 {ingest['baseline_median_7d']} 件/日）")
+        elif ingest["ratio_pct"] is not None and ingest["ratio_pct"] < INGEST_DROP_PCT:
+            alerts.append(f"[WARN] Sentry の取り込みイベントが急減：昨日 {ingest['yesterday']} 件、"
+                          f"直近 7 日の中央値 {ingest['baseline_median_7d']} 件/日の {ingest['ratio_pct']}%")
 
     if cw is not None:
         if cw.get("error"):
@@ -1029,6 +1078,7 @@ def build_ai_payload(snapshot):
         "web": snapshot["web"],
         "cloudwatch": snapshot.get("cloudwatch"),
         "nginx": snapshot.get("nginx"),
+        "sentry_ingest": snapshot.get("sentry_ingest"),
         "flags": snapshot["alerts"],   # 決定的な注目ポイント
         "rule_status": _overall(snapshot["alerts"]),
         "note_for_ai": ("flags はルールによる決定的な注目ポイント。リアルタイム通知は別途 Slack が担当している。"
@@ -1042,6 +1092,9 @@ def build_ai_payload(snapshot):
                         "nginx はリバースプロキシのアクセスログ集計（窓内のリクエスト数、5xx 件数と比率、ステータスコード別/パス別）。"
                         "restarted_since_last=true かつ restarts_delta=0 はクラッシュ以外の再起動（手動/再作成/定期ジョブ）。"
                         "host.disk_trend はディスク増加速度（GiB/日、線形回帰）と WARN/CRIT 閾値到達までの見込み日数・日付。"
+                        "sentry_ingest は Sentry が取り込んだエラーイベント数（ClickHouse、UTC 日別）。"
+                        "モバイルアプリのクラッシュ数なので曜日やリリースで自然に増減する。急減・0 件は取り込み経路の障害を疑う。"
+                        "nginx のリクエスト数と食い違う場合はどちらかの計測（ログ）の問題。"
                         "cloudwatch は AWS 側から見た本 EC2 インスタンスの指標（5 分粒度、latest と直近 1h/24h の avg/min/max、"
                         "単位は unit）で、ローカル信号との突き合わせに使う。cloudwatch が null の場合は無効。"),
     }
@@ -1250,6 +1303,20 @@ def render_markdown(snap, ai_text, generated_at):
             for path, cnt in n.get("top_paths", []):
                 L.append(f"  - {path}: {cnt} 件")
         L.append("")
+    ig = snap.get("sentry_ingest")
+    if ig:
+        L.append("## Sentry 取り込み量（エラーイベント / 日、UTC）")
+        L.append("")
+        if ig.get("error"):
+            L.append(f"- 取得失敗 {ig['error']}")
+        else:
+            L.append("| " + " | ".join(d[5:] for d in ig["by_day"]) + " |")
+            L.append("|" + "---|" * len(ig["by_day"]))
+            L.append("| " + " | ".join(str(v) for v in ig["by_day"].values()) + " |")
+            L.append("")
+            L.append(f"- 昨日 {ig['yesterday']} 件 / 直近 7 日の中央値 {ig['baseline_median_7d']} 件"
+                     f"（{ig['ratio_pct']}%）。最終列は当日の途中経過")
+        L.append("")
     cw = snap.get("cloudwatch")
     if cw is not None:
         L.append("## CloudWatch（EC2 インスタンス指標）")
@@ -1421,8 +1488,9 @@ def main():
         host["swap_io"]["since_last_min"] = round((t1 - prev["ts"]) / 60)
     if cinfo.get("error"):
         print(f"[warn] コンテナ情報の取得に失敗: {cinfo['error']}", file=sys.stderr)
+    ingest = collect_sentry_ingest() if not cinfo.get("error") else None
     cw = collect_cloudwatch()
-    alerts = compute_alerts(host, containers, web, cw, nginx)
+    alerts = compute_alerts(host, containers, web, cw, nginx, ingest)
     if cinfo.get("error"):
         # 取得できない ≠ 問題なし：総合ステータスを 🟢 にしてはいけない
         alerts.insert(0, f"[WARN] コンテナ状態の取得に失敗、今回の結果は不完全：{cinfo['error']}")
@@ -1437,6 +1505,7 @@ def main():
         "web": web,
         "cloudwatch": cw,
         "nginx": nginx,
+        "sentry_ingest": ingest,
         "alerts": alerts,
     }
 
