@@ -580,10 +580,13 @@ def collect_nginx(window_s):
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
             total = n5 = 0
             codes, paths = {}, {}
+            other = ""    # アクセスログ以外の最後の行（失敗時の原因表示用。docker のエラーは stderr→stdout に来る）
             deadline = time.time() + 60
             for line in proc.stdout:
                 m = _ACCESS_RE.search(line)
                 if not m:
+                    if line.strip():
+                        other = line.strip()
                     continue
                 total += 1
                 if m.group(3).startswith("5"):
@@ -598,7 +601,7 @@ def collect_nginx(window_s):
                     break
             proc.wait(timeout=10)
             if proc.returncode not in (0, None, -9) and total == 0:
-                raise RuntimeError(f"docker logs exit {proc.returncode}")
+                raise RuntimeError(f"docker logs exit {proc.returncode}" + (f": {other}" if other else ""))
             rec.update({"requests": total, "5xx": n5,
                         "5xx_pct": round(n5 * 100 / total, 2) if total else 0.0,
                         "by_code": codes,
