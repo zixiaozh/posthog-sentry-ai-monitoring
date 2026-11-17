@@ -113,8 +113,8 @@ DISK_FORECAST_WARN_DAYS = float(os.environ.get("DISK_FORECAST_WARN_DAYS", "30"))
 # AI
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").strip().lower()   # gemini | anthropic
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")  # 主モデルが再試行後も失敗したときに使う（空 = 降格しない）
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen")
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash")  # 主モデルが再試行後も失敗したときに使う（空 = 降格しない）
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 REPORT_LANG = os.environ.get("REPORT_LANG", "ja")
@@ -1173,7 +1173,7 @@ def _diagnose_gemini_model(snapshot, model):
     payload = {
         "systemInstruction": {"parts": [{"text": _system_prompt()}]},
         "contents": [{"role": "user", "parts": [{"text": _user_content(snapshot)}]}],
-        # 2.5 系は思考 token も maxOutputTokens に含まれるため、本文が途中で切れないよう余裕を持たせる
+        # 思考型モデルは思考 token も maxOutputTokens に含まれるため、本文が途中で切れないよう余裕を持たせる
         "generationConfig": {"maxOutputTokens": 8192},
     }
     data = _post_json(

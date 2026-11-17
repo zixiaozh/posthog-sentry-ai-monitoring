@@ -42,7 +42,7 @@ def _load_dotenv():
 _load_dotenv()
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen")
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
@@ -103,7 +103,7 @@ def main():
         hint = {
             400: "→ API キーが無効（API_KEY_INVALID）かリクエスト形式の誤りが多い。aistudio.google.com でキーを確認する。",
             403: "→ 権限なし / キーが制限されている。キーの制限と、プロジェクトで Generative Language API が有効かを確認する。",
-            404: "→ モデル名が誤っている。GEMINI_MODEL を確認する（例：gemini-2.5-pro / gemini-2.5-flash）。",
+            404: "→ モデル名が誤っている。GEMINI_MODEL を確認する（例：gemini-4-hydrogen / gemini-3.8-flash）。",
             429: "→ レート制限 / クォータ超過。時間を置くかモデルを変える。",
         }.get(e.code, "")
         sys.exit(f"[X] HTTP {e.code} {e.reason} {hint}\nレスポンス本文：{body}")

@@ -270,7 +270,7 @@ sudo python3 platform_health.py --notify-test        # SLACK_WEBHOOK_URL にテ�
 ### 7.2 エラー時のリカバリ
 
 - AI / Slack の呼び出しは 429 / 5xx / ネットワークエラー時に間隔を空けて再試行（最大 3 回）。
-- `gemini-2.5-pro` が再試行後も失敗したら `GEMINI_FALLBACK_MODEL`（既定 `gemini-2.5-flash`）に切り替え、レポートに明記する。AI がすべて失敗したらルール判定のみのレポートを出す。
+- 主モデル（`GEMINI_MODEL`）が再試行後も失敗したら `GEMINI_FALLBACK_MODEL`（既定 `gemini-3.8-flash`）に切り替え、レポートに明記する。AI がすべて失敗したらルール判定のみのレポートを出す。
 - `out/.lock` で巡検の重複実行を防ぐ。一部のデータソース（docker / CloudWatch / nginx ログ）が失敗しても INFO / WARN として記録し、他は続行する。
 
 ### 7.3 定期実行（1 日 1 回）
@@ -315,8 +315,8 @@ root の crontab（`sudo crontab -e`）に登録する。`systemd-run` で**本�
 | CW_CPU_WARN / CW_BALANCE_WARN / CW_CPU_CREDIT_WARN | 80 / 20 / 10 | CloudWatch の閾値 |
 | SLACK_WEBHOOK_URL | 空 | 状態変化の通知先。空なら送らない |
 | AI_PROVIDER | gemini | gemini / anthropic |
-| GEMINI_API_KEY / GEMINI_MODEL | 空 / gemini-2.5-pro | Gemini（AI Studio で発行） |
-| GEMINI_FALLBACK_MODEL | gemini-2.5-flash | 主モデル失敗時の降格先 |
+| GEMINI_API_KEY / GEMINI_MODEL | 空 / gemini-4-hydrogen | Gemini（AI Studio で発行） |
+| GEMINI_FALLBACK_MODEL | gemini-3.8-flash | 主モデル失敗時の降格先 |
 | ANTHROPIC_API_KEY / ANTHROPIC_MODEL | 空 / claude-sonnet-5-5 | Claude（Anthropic Console で発行、別途従量課金） |
 | REPORT_LANG | ja | AI 診断の言語 ja / zh / en |
 | KEEP_DAYS | 14 | 成果物の保存日数 |
