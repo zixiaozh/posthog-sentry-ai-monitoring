@@ -46,8 +46,12 @@ from urllib import request, error
 # 同じディレクトリの .env を自動で読み込む（既存の環境変数が優先、空の値は無視）
 # 設定を読む前に実行する。sudo は環境変数を消すため、スクリプト自身がファイルを読むのが確実。
 # ----------------------------------------------------------------------------
-def _load_dotenv():
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+def _load_dotenv(path=None):
+    # 単体テストは実際の .env（API キー・Webhook）に依存してはいけないため、PH_SKIP_DOTENV=1 で読み込みを止める
+    if path is None:
+        if os.environ.get("PH_SKIP_DOTENV") == "1":
+            return
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
