@@ -36,20 +36,13 @@ import json
 import os
 import socket
 import sys
-import time
 
 from monitoring import config as cfg
 from monitoring import ai
-from monitoring import cloudwatch
-from monitoring import docker
-from monitoring import nginx_log
+from monitoring import queries
 from monitoring import report
-from monitoring import rules
-from monitoring import sentry
 from monitoring import slack
 from monitoring import state
-from monitoring import system
-from monitoring import webcheck
 
 
 def _acquire_lock():
@@ -88,51 +81,11 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc)
     generated_at = now.strftime("%Y-%m-%d %H:%M:%S UTC")
-    t0, vm0 = time.time(), system.read_vmstat()
     prev = state.load_state()
-
-    host = system.collect_host()
-    disk_hist = system.update_disk_history(prev, host.get("disk", {}), t0)
-    host["disk_trend"] = system.disk_trend(disk_hist, host.get("disk", {}))
-    cinfo, containers = docker.collect_containers()
-    docker.collect_container_mem(containers)
-    state.apply_restart_delta(containers, prev)
-    docker.apply_mem_budgets(containers)
-    web = webcheck.collect_web()
-    nginx_window = min(time.time() - prev["ts"], cfg.NGINX_MAX_WINDOW_H * 3600) if prev.get("ts") else cfg.NGINX_MAX_WINDOW_H * 3600
-    nginx = nginx_log.collect_nginx(nginx_window) if not cinfo.get("error") else []
-
-    # swap 換ページ速度：今回の実行中（最低 3 秒の窓）+ 前回巡検以降の平均
-    elapsed = time.time() - t0
-    if elapsed < 3:
-        time.sleep(3 - elapsed)
-    t1, vm1 = time.time(), system.read_vmstat()
-    host["swap_io"] = {"now": system._swap_rate(vm0, vm1, t1 - t0), "now_window_s": round(t1 - t0, 1)}
-    if prev.get("ts") and prev.get("vmstat"):
-        host["swap_io"]["since_last"] = system._swap_rate(prev["vmstat"], vm1, t1 - prev["ts"])
-        host["swap_io"]["since_last_min"] = round((t1 - prev["ts"]) / 60)
-    if cinfo.get("error"):
-        print(f"[warn] コンテナ情報の取得に失敗: {cinfo['error']}", file=sys.stderr)
-    ingest = sentry.collect_sentry_ingest() if not cinfo.get("error") else None
-    cw = cloudwatch.collect_cloudwatch()
-    alerts = rules.compute_alerts(host, containers, web, cw, nginx, ingest)
-    if cinfo.get("error"):
-        # 取得できない ≠ 問題なし：総合ステータスを 🟢 にしてはいけない
-        alerts.insert(0, f"[WARN] コンテナ状態の取得に失敗、今回の結果は不完全：{cinfo['error']}")
-    elif cinfo.get("partial"):
-        alerts.insert(0, f"[WARN] 一部コンテナの状態取得に失敗：{cinfo['partial']}")
-
-    snapshot = {
-        "generated_at": generated_at,
-        "host": host,
-        "containers": containers,
-        "container_collect_error": cinfo.get("error"),
-        "web": web,
-        "cloudwatch": cw,
-        "nginx": nginx,
-        "sentry_ingest": ingest,
-        "alerts": alerts,
-    }
+    r = queries.run_checks(prev, generated_at)
+    snapshot, cinfo = r["snapshot"], r["cinfo"]
+    vm1, t1, disk_hist = r["vm1"], r["t1"], r["disk_hist"]
+    containers, alerts = snapshot["containers"], snapshot["alerts"]
 
     ai_payload = ai.build_ai_payload(snapshot)
 

@@ -137,6 +137,21 @@ sudo python3 platform_health.py --stdout        # 実行してレポートを表
 - CloudWatch を使うにはインスタンスロールに [iam/cloudwatch-read-policy.json](iam/cloudwatch-read-policy.json) の権限が必要。
 - 定期実行の設定、オプション、全環境変数は [SPEC.md](SPEC.md) の「7. 実行と設定」を参照。
 
+### 読み取り専用の収集 CLI（collect.py）
+
+AI エージェントが障害調査で監視データを参照するための入口（MCP サーバーから SSM 経由で呼ぶ予定）。
+許可リストのコマンドだけを実行し、出力はすべてマスキングする。設計は [docs/SECURITY.md](docs/SECURITY.md)。
+
+```bash
+sudo python3 collect.py list                                    # コマンドと引数の一覧
+sudo python3 collect.py status                                  # 全体の状態（ルール判定つき）
+sudo python3 collect.py nginx --hours 6
+sudo python3 collect.py logs --name sentry-self-hosted-nginx-1 --minutes 30 --contains " 502 " --max-lines 50
+```
+
+コマンド：`status` / `containers` / `container` / `host` / `nginx` / `sentry_ingest` / `cloudwatch` / `reports` / `logs`。
+`state.json` は書かない（日次巡検に影響しない）。呼び出しは `out/collect_audit.log` に記録される。
+
 ### テスト
 
 ```bash
@@ -145,7 +160,7 @@ python3 -m unittest discover -s tests
 
 - 標準ライブラリの `unittest` のみ（追加インストール不要、EC2 の Python 3.9 でも実行可）。
 - 実際の `.env`（API キー・Webhook）は読まず（`PH_SKIP_DOTENV=1`）、外部への HTTP 送信も禁止した状態で実行する。閾値はコードの既定値で検証する。
-- 対象：判定ルール（閾値・swap の降格・再起動の増分・既知の定期再起動）、状態変化時のみの通知と送信失敗時の再送、ディスク到達予測、nginx パスのマスキング（`sentry_key` を残さない）、docker ログ破損時のログファイル直接読み取り、Sentry 取り込み量の集計。
+- 対象：判定ルール（閾値・swap の降格・再起動の増分・既知の定期再起動）、状態変化時のみの通知と送信失敗時の再送、ディスク到達予測、nginx パスのマスキング（`sentry_key` を残さない）、docker ログ破損時のログファイル直接読み取り、Sentry 取り込み量の集計、collect.py の安全要件（許可リスト・引数検証・マスキング・無害化・出力上限・タイムアウト・監査・読み取り専用）。
 - 判定ロジックを変えたらテストも更新する。
 
 ### コード管理
@@ -160,6 +175,7 @@ posthog-sentry-ai-monitoring/
 ├── README.md                        # 本ファイル（概要・目的・成果・進捗）
 ├── SPEC.md                          # 仕様書（収集項目・閾値・AI 入力・通知・運用）
 ├── platform_health.py               # 日次巡検の CLI（引数・ロック・実行の流れ）
+├── collect.py                       # 読み取り専用の収集 CLI（許可リスト・マスキング・監査。MCP から SSM 経由で呼ぶ）
 ├── monitoring/                      # 共通処理（標準ライブラリのみ。MCP サーバー等からも利用する）
 │   ├── config.py                    #   設定（.env と環境変数。cfg.X として実行時に参照）
 │   ├── docker.py / system.py        #   収集：コンテナ / ホスト（swap 換ページ・ディスク予測）
@@ -167,7 +183,10 @@ posthog-sentry-ai-monitoring/
 │   ├── sentry.py / cloudwatch.py    #   収集：Sentry 取り込み量 / CloudWatch
 │   ├── state.py / rules.py          #   前回との比較 / 判定ルール
 │   ├── ai.py / httpclient.py        #   AI 診断 / HTTP 送信（再試行）
-│   └── report.py / slack.py         #   Markdown レポート / 状態変化時の Slack 通知
+│   ├── report.py / slack.py         #   Markdown レポート / 状態変化時の Slack 通知
+│   ├── queries.py                   #   collect.py のコマンド（許可リスト）と巡検の共通処理
+│   └── mask.py                      #   出力のマスキングと外部由来文字列の無害化
+├── docs/SECURITY.md                 # セキュリティ設計（信頼境界・脅威と対策）
 ├── test_gemini.py                   # Gemini API の疎通テスト
 ├── iam/cloudwatch-read-policy.json  # インスタンスロールに付与する最小権限
 ├── tests/                           # 単体テスト（判定ルール・通知・マスキング・ログ破損時の代替経路）
