@@ -4,7 +4,8 @@ import contextlib
 import unittest
 from unittest import mock
 
-from _base import h
+import _base  # noqa: F401  （.env 無効化・外部送信禁止の準備）
+from monitoring import config as cfg, rules, slack
 
 WARN_DISK = "[WARN] ディスクが +1.3GiB/日 で増加中、約 23 日後（2026-12-10 頃）に 85.0% 到達見込み"
 WARN_DISK_NEXT_DAY = "[WARN] ディスクが +1.4GiB/日 で増加中、約 22 日後（2026-12-09 頃）に 85.0% 到達見込み"
@@ -14,21 +15,21 @@ INFO_RESTART = "[INFO] コンテナ x が前回巡検以降に再起動された
 
 def state(alerts):
     """前回「通知に成功した」状態。"""
-    cur = {h._alert_key(a): a for a in alerts if a.startswith(("[WARN]", "[CRIT]"))}
-    return {"v": h.NOTIFY_STATE_VERSION, "status": h._overall(alerts), "keys": cur}
+    cur = {slack._alert_key(a): a for a in alerts if a.startswith(("[WARN]", "[CRIT]"))}
+    return {"v": slack.NOTIFY_STATE_VERSION, "status": rules._overall(alerts), "keys": cur}
 
 
 class TestNotify(unittest.TestCase):
     def setUp(self):
         self.sent = []
-        p1 = mock.patch.object(h, "_send_slack", side_effect=lambda *a: self.sent.append(a))
-        p2 = mock.patch.object(h, "SLACK_WEBHOOK_URL", "https://example.invalid/webhook")
+        p1 = mock.patch.object(slack, "_send_slack", side_effect=lambda *a: self.sent.append(a))
+        p2 = mock.patch.object(cfg, "SLACK_WEBHOOK_URL", "https://example.invalid/webhook")
         p1.start(), p2.start()
         self.addCleanup(mock.patch.stopall)
 
     def run_notify(self, alerts, prev, ai_text=""):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            return h.notify_on_change(alerts, prev, ai_text, "2026-11-19 00:00:00 UTC")
+            return slack.notify_on_change(alerts, prev, ai_text, "2026-11-19 00:00:00 UTC")
 
     def test_no_change_no_message(self):
         new = self.run_notify([WARN_DISK], state([WARN_DISK]))
@@ -72,31 +73,31 @@ class TestNotify(unittest.TestCase):
     def test_send_failure_keeps_previous_state(self):
         # 送信失敗 → 通知済みにしない（次回の実行で再送される）
         prev = state([])
-        with mock.patch.object(h, "_send_slack", side_effect=RuntimeError("HTTP 500")):
+        with mock.patch.object(slack, "_send_slack", side_effect=RuntimeError("HTTP 500")):
             new = self.run_notify([WARN_DISK], prev)
         self.assertIs(new, prev)
 
     def test_no_webhook_keeps_previous_state(self):
         prev = state([])
-        with mock.patch.object(h, "SLACK_WEBHOOK_URL", ""):
+        with mock.patch.object(cfg, "SLACK_WEBHOOK_URL", ""):
             new = self.run_notify([WARN_DISK], prev)
         self.assertIs(new, prev)
         self.assertEqual(self.sent, [])
 
     def test_old_state_version_compares_status_only(self):
         # 文言変更前の state：個別アラートは比較できないため、総合ステータスが同じなら通知しない
-        old = {"v": h.NOTIFY_STATE_VERSION - 1, "status": "注意", "keys": {"旧文言": "[WARN] 旧文言"}}
+        old = {"v": slack.NOTIFY_STATE_VERSION - 1, "status": "注意", "keys": {"旧文言": "[WARN] 旧文言"}}
         new = self.run_notify([WARN_DISK], old)
         self.assertEqual(self.sent, [])
-        self.assertEqual(new["v"], h.NOTIFY_STATE_VERSION)
+        self.assertEqual(new["v"], slack.NOTIFY_STATE_VERSION)
 
 
 class TestAlertKey(unittest.TestCase):
     def test_digits_are_normalized(self):
-        self.assertEqual(h._alert_key(WARN_DISK), h._alert_key(WARN_DISK_NEXT_DAY))
+        self.assertEqual(slack._alert_key(WARN_DISK), slack._alert_key(WARN_DISK_NEXT_DAY))
 
     def test_different_problems_differ(self):
-        self.assertNotEqual(h._alert_key(WARN_DISK), h._alert_key(CRIT_WEB))
+        self.assertNotEqual(slack._alert_key(WARN_DISK), slack._alert_key(CRIT_WEB))
 
 
 if __name__ == "__main__":

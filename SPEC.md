@@ -3,7 +3,7 @@
 自前ホストの **Sentry + PostHog プラットフォーム**（EC2・Docker）の健康巡検スクリプト。
 本書では **何をチェックするか、閾値と指標、AI に何を渡すか、通知と運用** を説明する。
 
-- 対象：`platform_health.py`（外部依存なし。Python 標準ライブラリ + aws CLI）
+- 対象：`platform_health.py`（CLI）と `monitoring/` パッケージ（収集・判定・AI・通知の本体）。外部依存なし（Python 標準ライブラリ + aws CLI）
 - 位置づけ：**1 日 1 回の診断と予測 + AI による原因分析**。リアルタイム通知の `slack_alert.sh` / `slack_alert_http.sh` を補完し、役割は重複させない
 - データソース：ローカル（docker / /proc / nginx ログ / HTTP 疎通 / Sentry の ClickHouse 取り込み件数）+ CloudWatch。Sentry / PostHog へのログインや API token は不要
 

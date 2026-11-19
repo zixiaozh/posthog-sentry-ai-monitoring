@@ -17,14 +17,14 @@ for _k in list(os.environ):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import platform_health as h  # noqa: E402
+from monitoring import httpclient, rules  # noqa: E402
 
 
 def _no_network(*args, **kwargs):
-    raise AssertionError("テスト中に外部 HTTP 送信が呼ばれた（_post はモックすること）")
+    raise AssertionError("テスト中に外部 HTTP 送信が呼ばれた（httpclient._post はモックすること）")
 
 
-h._post = _no_network
+httpclient._post = _no_network   # AI・Slack はすべて httpclient._post を経由する
 
 
 def container(name="sentry-self-hosted-web-1", **kw):
@@ -38,7 +38,7 @@ def container(name="sentry-self-hosted-web-1", **kw):
 
 def alerts_for(**kw):
     """compute_alerts をキーワード引数で呼ぶ（未指定は空）。"""
-    return h.compute_alerts(kw.get("host", {}), kw.get("containers", []), kw.get("web", []),
+    return rules.compute_alerts(kw.get("host", {}), kw.get("containers", []), kw.get("web", []),
                             kw.get("cw"), kw.get("nginx"), kw.get("ingest"))
 
 

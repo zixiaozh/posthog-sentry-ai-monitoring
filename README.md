@@ -159,7 +159,15 @@ python3 -m unittest discover -s tests
 posthog-sentry-ai-monitoring/
 ├── README.md                        # 本ファイル（概要・目的・成果・進捗）
 ├── SPEC.md                          # 仕様書（収集項目・閾値・AI 入力・通知・運用）
-├── platform_health.py               # 本体
+├── platform_health.py               # 日次巡検の CLI（引数・ロック・実行の流れ）
+├── monitoring/                      # 共通処理（標準ライブラリのみ。MCP サーバー等からも利用する）
+│   ├── config.py                    #   設定（.env と環境変数。cfg.X として実行時に参照）
+│   ├── docker.py / system.py        #   収集：コンテナ / ホスト（swap 換ページ・ディスク予測）
+│   ├── webcheck.py / nginx_log.py   #   収集：Web 疎通 / nginx ログ（パスのマスキング・破損時の代替経路）
+│   ├── sentry.py / cloudwatch.py    #   収集：Sentry 取り込み量 / CloudWatch
+│   ├── state.py / rules.py          #   前回との比較 / 判定ルール
+│   ├── ai.py / httpclient.py        #   AI 診断 / HTTP 送信（再試行）
+│   └── report.py / slack.py         #   Markdown レポート / 状態変化時の Slack 通知
 ├── test_gemini.py                   # Gemini API の疎通テスト
 ├── iam/cloudwatch-read-policy.json  # インスタンスロールに付与する最小権限
 ├── tests/                           # 単体テスト（判定ルール・通知・マスキング・ログ破損時の代替経路）

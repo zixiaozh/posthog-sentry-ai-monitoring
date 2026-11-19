@@ -1,17 +1,18 @@
 """判定ルール（compute_alerts / _overall）のテスト。閾値は SPEC.md「3. 閾値と判定ルール」の既定値。"""
 import unittest
 
-from _base import h, container, alerts_for, levels
+from _base import container, alerts_for, levels
+from monitoring import rules
 
 
 class TestOverall(unittest.TestCase):
     def test_info_does_not_change_status(self):
-        self.assertEqual(h._overall(["[INFO] x"]), "正常")
+        self.assertEqual(rules._overall(["[INFO] x"]), "正常")
 
     def test_warn_and_crit(self):
-        self.assertEqual(h._overall(["[INFO] a", "[WARN] b"]), "注意")
-        self.assertEqual(h._overall(["[WARN] a", "[CRIT] b"]), "危険")
-        self.assertEqual(h._overall([]), "正常")
+        self.assertEqual(rules._overall(["[INFO] a", "[WARN] b"]), "注意")
+        self.assertEqual(rules._overall(["[WARN] a", "[CRIT] b"]), "危険")
+        self.assertEqual(rules._overall([]), "正常")
 
 
 class TestHost(unittest.TestCase):
