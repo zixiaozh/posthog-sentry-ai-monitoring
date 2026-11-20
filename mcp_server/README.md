@@ -28,26 +28,30 @@ EC2 内部のデータ（コンテナ・ホスト・nginx・Sentry 取り込み�
 
 ## セットアップ
 
-### 1. Python 環境（Python 3.10 以上）
-
-```bash
-python3 -m venv mcp_server/.venv
-mcp_server/.venv/bin/pip install -r mcp_server/requirements.txt
+```
+[管理者が 1 回だけ]  iam/create_mcp_role.sh      → ロール ai-monitoring-mcp-readonly とグループ ai-monitoring-users を作る
+[使う人ごと]         ~/.aws/config に 3 行追加     → 自分の IAM ユーザーからロールを引き受けるプロファイル
+                     mcp_server/setup.sh          → venv 作成・ロールの確認・接続確認
+                     リポジトリで Claude Code を開く → .mcp.json の ai-monitoring を初回だけ承認
 ```
 
-### 2. MCP 専用の IAM ロールとプロファイル
-
-長期のアクセスキーは新たに作らず、自分の IAM ユーザーから **読み取り専用ロールを引き受ける（AssumeRole）** 形にする。
+### 1. AWS 側（管理者が 1 回だけ）
 
 ```bash
-# iam/mcp-readonly-trust.json の <ACCOUNT_ID> と <IAM_USER_NAME> を自分のものに置き換えてから
-aws iam create-role --role-name ai-monitoring-mcp-readonly \
-    --assume-role-policy-document file://iam/mcp-readonly-trust.json
-aws iam put-role-policy --role-name ai-monitoring-mcp-readonly \
-    --policy-name mcp-readonly --policy-document file://iam/mcp-readonly-policy.json
+iam/create_mcp_role.sh            # 管理者権限のプロファイルで。確認のあと作成し、実行者を自動でグループに追加
 ```
 
-`~/.aws/config` に追記：
+- ロール `ai-monitoring-mcp-readonly`：[iam/mcp-readonly-policy.json](../iam/mcp-readonly-policy.json)（CloudWatch の読み取り 2 操作のみ。
+  `ssm:StartSession`・IAM 操作等は明示的に拒否）。
+- グループ `ai-monitoring-users`：このロールを AssumeRole できる権限だけを持つ。**使う人の追加・交代はグループのメンバーを変えるだけ**：
+  `aws iam add-user-to-group --group-name ai-monitoring-users --user-name <名前>`
+- IAM のグループは信任ポリシーの Principal に書けないため、ロールの信任は「同じアカウントの、AssumeRole を許可された者」とし、
+  誰が使えるかはグループ側のポリシーで決める。
+- 長期のアクセスキーは新たに作らない。各自が自分の IAM ユーザーの認証情報から一時的にロールを引き受ける（CloudTrail に本人の名前が残る）。
+
+### 2. 使う人ごと（新しい環境・引き継ぎ時も同じ）
+
+`~/.aws/config` に追記（`<ACCOUNT_ID>` は create_mcp_role.sh の最後に表示される）：
 
 ```ini
 [profile mcp-readonly]
@@ -56,27 +60,33 @@ source_profile = default
 region = ap-northeast-1
 ```
 
-確認（`assumed-role/ai-monitoring-mcp-readonly/...` と表示されればよい。2 行目は AccessDenied になるのが正しい）：
-
 ```bash
-aws sts get-caller-identity --profile mcp-readonly
-aws ec2 describe-instances --profile mcp-readonly --max-items 1
+mcp_server/setup.sh
 ```
 
-ポリシー（[iam/mcp-readonly-policy.json](../iam/mcp-readonly-policy.json)）は CloudWatch の読み取り 2 操作だけを許可し、
-`ssm:StartSession`（シェル）・IAM 操作などを明示的に拒否する。
+setup.sh は何度実行してもよい。次を順に確認し、問題があればそこで止まって理由を表示する：
+1. Python 3.10 以上で `mcp_server/.venv` を作り、MCP SDK を入れる
+2. プロファイルが `assumed-role/ai-monitoring-mcp-readonly/...` になること、CloudWatch 以外（SSM）の操作が拒否されること
+3. Claude Code と同じ stdio でサーバーを起動し、ツールを 1 回呼べること（`mcp_server/selftest.py`）
 
-### 3. Claude Code に登録
+### 3. Claude Code で使う
+
+リポジトリのディレクトリで Claude Code を開くと、[.mcp.json](../.mcp.json) の `ai-monitoring` が見つかり、初回だけ有効にするか確認される。
+接続先は `.mcp.json` の既定値（`MCP_AWS_PROFILE` 等）で、同名の環境変数を設定すれば上書きできる。
+
+どのディレクトリでも使いたい場合は、ユーザー単位で登録する：
 
 ```bash
-claude mcp add ai-monitoring \
-    -e MCP_AWS_PROFILE=mcp-readonly \
-    -e MCP_INSTANCE_ID=i-08ba45b5cffc2313e \
-    -e MCP_REGION=ap-northeast-1 \
-    -- "$PWD/mcp_server/.venv/bin/python" "$PWD/mcp_server/server.py"
+claude mcp add -s user ai-monitoring -e MCP_AWS_PROFILE=mcp-readonly \
+    -e MCP_INSTANCE_ID=i-08ba45b5cffc2313e -e MCP_REGION=ap-northeast-1 -- "$PWD/mcp_server/run.sh"
 ```
 
-登録後、Claude Code で「11/8 未明に EBS の書き込みが増えていないか調べて」のように聞くと、ツールを使って調べる。
+例：「11/8 未明に EBS の書き込みが増えていないか調べて」のように聞くと、ツールを使って調べる。
+
+### 読み取り専用を確実にするには
+
+同じ環境の Claude Code がシェル（Bash）と管理者の認証情報も使えると、MCP を迂回できてしまう。
+調査用のセッションでは Bash を無効にし MCP のツールだけを許可する、または管理者の認証情報を置かない環境で使う。
 
 ## テスト
 

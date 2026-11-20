@@ -197,11 +197,13 @@ posthog-sentry-ai-monitoring/
 ├── mcp_server/                      # 読み取り専用の MCP サーバー（利用者の PC で動かす。MCP SDK が必要）
 │   ├── server.py                    #   MCP へのツール登録と起動時チェック
 │   ├── tools.py                     #   ツールの実体（引数検証・マスキング・上限・監査。標準ライブラリのみ）
+│   ├── run.sh / setup.sh / selftest.py  # 起動 / セットアップと確認 / 接続確認
 │   └── README.md                    #   セットアップ（IAM ロール・Claude Code への登録）
 ├── docs/SECURITY.md                 # セキュリティ設計（信頼境界・脅威と対策）
 ├── test_gemini.py                   # Gemini API の疎通テスト
 ├── iam/cloudwatch-read-policy.json  # インスタンスロールに付与する最小権限
-├── iam/mcp-readonly-*.json          # MCP 専用ロールの権限と信頼ポリシー
+├── iam/mcp-*.json, create_mcp_role.sh  # MCP 専用ロール・利用者グループの権限と作成スクリプト
+├── .mcp.json                        # Claude Code 用の MCP サーバー定義（プロジェクト単位、初回に承認）
 ├── tests/                           # 単体テスト（判定ルール・通知・マスキング・ログ破損時の代替経路）
 ├── .env.example                     # 設定テンプレート
 └── out/                             # 実行成果物（コミット対象外）

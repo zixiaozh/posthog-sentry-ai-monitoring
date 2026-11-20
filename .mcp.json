@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ai-monitoring": {
+      "type": "stdio",
+      "command": "sh",
+      "args": ["-c", "cd \"$CLAUDE_PROJECT_DIR\" 2>/dev/null; exec mcp_server/run.sh"],
+      "env": {
+        "MCP_AWS_PROFILE": "${MCP_AWS_PROFILE:-mcp-readonly}",
+        "MCP_INSTANCE_ID": "${MCP_INSTANCE_ID:-i-08ba45b5cffc2313e}",
+        "MCP_REGION": "${MCP_REGION:-ap-northeast-1}"
+      }
+    }
+  }
+}
