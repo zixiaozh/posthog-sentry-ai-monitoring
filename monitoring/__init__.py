@@ -14,6 +14,9 @@
   httpclient  HTTP POST（再試行）
   report      Markdown レポート
   slack       状態変化時の Slack 通知
+  queries     collect.py のコマンド（許可リスト）と巡検の共通処理
+  mask        出力のマスキングと外部由来文字列の無害化
+  audit       監査ログ（collect.py と MCP サーバーで共用）
 
 標準ライブラリのみに依存する（EC2 の日次巡検でそのまま使うため）。
 """

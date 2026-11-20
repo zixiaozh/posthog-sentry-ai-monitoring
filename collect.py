@@ -22,6 +22,7 @@ import signal
 import sys
 import time
 
+from monitoring import audit
 from monitoring import config as cfg
 from monitoring import mask
 from monitoring import queries
@@ -39,15 +40,8 @@ def _emit(obj, code):
 
 
 def _audit(rec):
-    """誰が・いつ・何を・どの引数で実行し、成否と出力サイズはどうだったかを 1 行 JSON で追記する。失敗しても本処理は止めない。"""
-    try:
-        os.makedirs(cfg.OUT_DIR, exist_ok=True)
-        if os.path.exists(AUDIT_FILE) and os.path.getsize(AUDIT_FILE) > AUDIT_MAX_BYTES:
-            os.replace(AUDIT_FILE, AUDIT_FILE + ".1")
-        with open(AUDIT_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(mask.mask_obj(rec), ensure_ascii=False, default=str) + "\n")
-    except OSError as e:
-        print(f"[warn] 監査ログに書けない：{e}", file=sys.stderr)
+    """誰が・いつ・何を・どの引数で実行し、成否と出力サイズはどうだったかを 1 行 JSON で追記する。"""
+    audit.append(AUDIT_FILE, rec, AUDIT_MAX_BYTES)
 
 
 def _parse(argv):

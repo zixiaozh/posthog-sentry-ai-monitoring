@@ -56,16 +56,19 @@ def _instance_identity():
     return iid, region, itype
 
 
-def _aws(args, region, timeout=40):
+def _aws(args, region, timeout=40, profile=None):
+    """aws CLI を実行して JSON を返す。profile 指定時は --profile（環境変数の認証情報より優先される）。"""
+    cmd = ["aws"] + args + ["--region", region, "--output", "json"]
+    if profile:
+        cmd += ["--profile", profile]
     try:
-        r = subprocess.run(["aws"] + args + ["--region", region, "--output", "json"],
-                           capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"aws {args[1]} タイムアウト（{timeout}s）") from None
     if r.returncode:
         err = r.stderr
         if "AccessDenied" in err or "not authorized" in err:
-            raise RuntimeError(f"IAM 権限不足：インスタンスロールに cloudwatch:{_CW_ACTION.get(args[1], args[1])} がない")
+            raise RuntimeError(f"IAM 権限不足：cloudwatch:{_CW_ACTION.get(args[1], args[1])} が許可されていない")
         raise RuntimeError(f"aws {args[1]} 失敗：{util._short(err)}")
     return json.loads(r.stdout or "{}")
 
@@ -73,14 +76,22 @@ def _aws(args, region, timeout=40):
 _CW_ACTION = {"get-metric-data": "GetMetricData", "describe-alarms": "DescribeAlarms"}
 
 
-def _summarize(points, conv):
-    """points: [(ts, value)] 新→旧。latest と直近 1h / 24h の avg/min/max を返す（単位換算済み）。"""
+def _converter(conv, period=CW_PERIOD):
+    if conv == "kbps":
+        return lambda v: v / period / 1024
+    if conv == "rate":
+        return lambda v: v / period
+    return lambda v: v
+
+
+def _summarize(points, conv, window_h=24):
+    """points: [(ts, value)] 新→旧。latest と直近 1h / 期間全体（window_h）の avg/min/max を返す（単位換算済み）。"""
     if not points:
         return None
-    f = (lambda v: v / CW_PERIOD / 1024) if conv == "kbps" else (lambda v: v / CW_PERIOD) if conv == "rate" else (lambda v: v)
+    f = _converter(conv)
     newest = points[0][0]
     out = {"latest": round(f(points[0][1]), 1)}
-    for label, hours in (("1h", 1), ("24h", 24)):
+    for label, hours in (("1h", 1), (f"{window_h}h", window_h)):
         vals = [f(v) for ts, v in points if (newest - ts).total_seconds() < hours * 3600]
         if vals:
             out[label] = {"avg": round(sum(vals) / len(vals), 1), "min": round(min(vals), 1), "max": round(max(vals), 1)}
@@ -89,6 +100,57 @@ def _summarize(points, conv):
 
 def _parse_cw_ts(s):
     return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def _query(iid, qid, name, stat, period):
+    return {"Id": qid, "ReturnData": True,
+            "MetricStat": {"Metric": {"Namespace": "AWS/EC2", "MetricName": name,
+                                      "Dimensions": [{"Name": "InstanceId", "Value": iid}]},
+                           "Period": period, "Stat": stat}}
+
+
+def _get_metric_data(iid, region, metrics, start, end, period, profile=None):
+    """metrics: CW_METRICS の部分集合。{qid: [(ts, 生の値)] 新→旧} を返す。失敗時は RuntimeError。"""
+    data = _aws(["cloudwatch", "get-metric-data",
+                 "--metric-data-queries", json.dumps([_query(iid, m[0], m[1], m[2], period) for m in metrics]),
+                 "--start-time", start.isoformat(),
+                 "--end-time", end.isoformat(),
+                 "--scan-by", "TimestampDescending"], region, profile=profile)
+    return {res.get("Id"): list(zip(map(_parse_cw_ts, res.get("Timestamps", [])), res.get("Values", [])))
+            for res in data.get("MetricDataResults", [])}
+
+
+def fetch_metrics(iid, region, hours=24, end=None, profile=None):
+    """全指標の要約 {qid: {latest, 1h, <hours>h, unit}}。データのない指標（T 系以外の CPUCreditBalance 等）は省略。"""
+    end = end or dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+    raw = _get_metric_data(iid, region, CW_METRICS, end - dt.timedelta(hours=hours), end, CW_PERIOD, profile)
+    meta = {q[0]: q for q in CW_METRICS}
+    metrics = {}
+    for qid, pts in raw.items():
+        summ = _summarize(pts, meta[qid][3], hours) if qid in meta else None
+        if summ:
+            summ["unit"] = meta[qid][4]
+            metrics[qid] = summ
+    return metrics
+
+
+def fetch_series(iid, region, qid, hours, end, period, profile=None):
+    """1 指標の時系列 [[ISO 時刻, 値], ...]（古→新、単位換算済み）。"""
+    m = next(x for x in CW_METRICS if x[0] == qid)
+    raw = _get_metric_data(iid, region, [m], end - dt.timedelta(hours=hours), end, period, profile)
+    f = _converter(m[3], period)
+    pts = sorted(raw.get(qid, []))
+    return [[ts.strftime("%Y-%m-%dT%H:%MZ"), round(f(v), 2)] for ts, v in pts]
+
+
+def fetch_alarms(iid, region, profile=None):
+    """本インスタンスに紐づく CloudWatch アラーム（ディメンションに本インスタンス ID を含むもの）。"""
+    alarms = _aws(["cloudwatch", "describe-alarms"], region, profile=profile).get("MetricAlarms", [])
+    mine = [a for a in alarms if any(d.get("Value") == iid for d in a.get("Dimensions", []))]
+    return [{"name": a.get("AlarmName"), "state": a.get("StateValue"),
+             "metric": a.get("MetricName"), "threshold": a.get("Threshold"),
+             "updated": a.get("StateUpdatedTimestamp"),
+             "reason": util._short(a.get("StateReason"), 160)} for a in mine]
 
 
 def collect_cloudwatch():
@@ -107,39 +169,13 @@ def collect_cloudwatch():
     cw.update({"instance_id": iid, "region": region, "instance_type": itype, "period_s": CW_PERIOD})
 
     # --- 指標：GetMetricData 1 回で 24h 分を取得（12 指標 × 288 点、1 回の上限を大きく下回る）
-    end = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
-    queries = [{"Id": qid, "ReturnData": True,
-                "MetricStat": {"Metric": {"Namespace": "AWS/EC2", "MetricName": name,
-                                          "Dimensions": [{"Name": "InstanceId", "Value": iid}]},
-                               "Period": CW_PERIOD, "Stat": stat}}
-               for qid, name, stat, _, _ in CW_METRICS]
     try:
-        data = _aws(["cloudwatch", "get-metric-data",
-                     "--metric-data-queries", json.dumps(queries),
-                     "--start-time", (end - dt.timedelta(hours=24)).isoformat(),
-                     "--end-time", end.isoformat(),
-                     "--scan-by", "TimestampDescending"], region)
-        meta = {q[0]: q for q in CW_METRICS}
-        metrics = {}
-        for res in data.get("MetricDataResults", []):
-            qid = res.get("Id")
-            pts = list(zip(map(_parse_cw_ts, res.get("Timestamps", [])), res.get("Values", [])))
-            summ = _summarize(pts, meta[qid][3]) if qid in meta else None
-            if summ:   # データのない指標（T 系以外の CPUCreditBalance 等）は省略
-                summ["unit"] = meta[qid][4]
-                metrics[qid] = summ
-        cw["metrics"] = metrics
+        cw["metrics"] = fetch_metrics(iid, region, 24)
     except RuntimeError as e:
         cw["error"] = str(e)
         return cw
-
-    # --- 本インスタンスに紐づく CloudWatch アラーム（ディメンションに本インスタンス ID を含むもの）
     try:
-        alarms = _aws(["cloudwatch", "describe-alarms"], region).get("MetricAlarms", [])
-        mine = [a for a in alarms if any(d.get("Value") == iid for d in a.get("Dimensions", []))]
-        cw["alarms"] = [{"name": a.get("AlarmName"), "state": a.get("StateValue"),
-                         "metric": a.get("MetricName"), "threshold": a.get("Threshold"),
-                         "reason": util._short(a.get("StateReason"), 160)} for a in mine]
+        cw["alarms"] = fetch_alarms(iid, region)
     except RuntimeError as e:
         cw["alarms_error"] = str(e)   # アラームが取れなくても指標には影響しない
     return cw

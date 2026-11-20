@@ -152,6 +152,12 @@ sudo python3 collect.py logs --name sentry-self-hosted-nginx-1 --minutes 30 --co
 コマンド：`status` / `containers` / `container` / `host` / `nginx` / `sentry_ingest` / `cloudwatch` / `reports` / `logs`。
 `state.json` は書かない（日次巡検に影響しない）。呼び出しは `out/collect_audit.log` に記録される。
 
+### 読み取り専用の MCP サーバー（mcp_server/）
+
+AI エージェント（Claude Code 等）から監視データを読み取り専用で参照するための MCP サーバー。利用者の PC で動かす。
+現在は CloudWatch（指標の要約・時系列・アラーム）を、MCP 専用の読み取り専用 IAM ロールで直接参照する。
+EC2 内部のデータ（collect.py）は SSM 経由で今後追加する。セットアップは [mcp_server/README.md](mcp_server/README.md)。
+
 ### テスト
 
 ```bash
@@ -160,13 +166,14 @@ python3 -m unittest discover -s tests
 
 - 標準ライブラリの `unittest` のみ（追加インストール不要、EC2 の Python 3.9 でも実行可）。
 - 実際の `.env`（API キー・Webhook）は読まず（`PH_SKIP_DOTENV=1`）、外部への HTTP 送信も禁止した状態で実行する。閾値はコードの既定値で検証する。
-- 対象：判定ルール（閾値・swap の降格・再起動の増分・既知の定期再起動）、状態変化時のみの通知と送信失敗時の再送、ディスク到達予測、nginx パスのマスキング（`sentry_key` を残さない）、docker ログ破損時のログファイル直接読み取り、Sentry 取り込み量の集計、collect.py の安全要件（許可リスト・引数検証・マスキング・無害化・出力上限・タイムアウト・監査・読み取り専用）。
+- 対象：判定ルール（閾値・swap の降格・再起動の増分・既知の定期再起動）、状態変化時のみの通知と送信失敗時の再送、ディスク到達予測、nginx パスのマスキング（`sentry_key` を残さない）、docker ログ破損時のログファイル直接読み取り、Sentry 取り込み量の集計、collect.py の安全要件（許可リスト・引数検証・マスキング・無害化・出力上限・タイムアウト・監査・読み取り専用）、MCP サーバーの安全要件（接続先の固定・default プロファイルの拒否・引数検証・マスキング・出力上限・監査・readOnlyHint の宣言）。
+- MCP サーバーのテスト（`TestServer`）は MCP SDK のある環境でだけ実行される（`mcp_server/.venv/bin/python -m unittest discover -s tests`）。
 - 判定ロジックを変えたらテストも更新する。
 
 ### コード管理
 
 - 本リポジトリ（GitHub）を正とし、EC2 は `git pull` で更新するだけの実行環境とする。
-- **コミットしないもの**：`.env`（API キー・Webhook URL）、`out/`（実行成果物）。
+- **コミットしないもの**：`.env`（API キー・Webhook URL）、`out/`（実行成果物）、`mcp_server/.venv/`。
 
 ### ディレクトリ構成
 
@@ -185,10 +192,16 @@ posthog-sentry-ai-monitoring/
 │   ├── ai.py / httpclient.py        #   AI 診断 / HTTP 送信（再試行）
 │   ├── report.py / slack.py         #   Markdown レポート / 状態変化時の Slack 通知
 │   ├── queries.py                   #   collect.py のコマンド（許可リスト）と巡検の共通処理
-│   └── mask.py                      #   出力のマスキングと外部由来文字列の無害化
+│   ├── mask.py                      #   出力のマスキングと外部由来文字列の無害化
+│   └── audit.py                     #   監査ログ（collect.py と MCP サーバーで共用）
+├── mcp_server/                      # 読み取り専用の MCP サーバー（利用者の PC で動かす。MCP SDK が必要）
+│   ├── server.py                    #   MCP へのツール登録と起動時チェック
+│   ├── tools.py                     #   ツールの実体（引数検証・マスキング・上限・監査。標準ライブラリのみ）
+│   └── README.md                    #   セットアップ（IAM ロール・Claude Code への登録）
 ├── docs/SECURITY.md                 # セキュリティ設計（信頼境界・脅威と対策）
 ├── test_gemini.py                   # Gemini API の疎通テスト
 ├── iam/cloudwatch-read-policy.json  # インスタンスロールに付与する最小権限
+├── iam/mcp-readonly-*.json          # MCP 専用ロールの権限と信頼ポリシー
 ├── tests/                           # 単体テスト（判定ルール・通知・マスキング・ログ破損時の代替経路）
 ├── .env.example                     # 設定テンプレート
 └── out/                             # 実行成果物（コミット対象外）
